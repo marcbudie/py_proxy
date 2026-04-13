@@ -4,7 +4,8 @@
   "tls_routes": {
     "padel.freecourts.nl": {"host": "192.168.2.76", "port": 8443, "name": "padel",   "enabled": true, "backend_ssl": false, "strip_path": true},
     "home.budie.eu":        {"host": "192.168.2.76", "port": 300,  "name": "home",    "enabled": true, "backend_ssl": false, "strip_path": true},
-    "cockpit.budie.eu":     {"host": "192.168.2.76", "port": 9090, "name": "cockpit", "enabled": true, "backend_ssl": false, "strip_path": true}
+    "cockpit.budie.eu":     {"host": "192.168.2.76", "port": 9090, "name": "cockpit", "enabled": true, "backend_ssl": false, "strip_path": true},
+    "home.budie.eu/pfsense": {"host": "192.168.2.72", "port": 443,  "name": "pfsense", "enabled": true, "backend_ssl": true,  "strip_path": true}
   },
   "connect_timeout": 10,
   "read_timeout": 5,
