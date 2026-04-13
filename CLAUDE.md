@@ -29,16 +29,32 @@ python3 proxy.py pad/naar/config.json
   "listen_host": "0.0.0.0",
   "listen_ports": [8444],
   "tls_routes": {
-    "voorbeeld.nl": {"host": "192.168.1.10", "port": 443, "name": "label", "enabled": true}
+    "voorbeeld.nl": {"host": "192.168.1.10", "port": 443, "name": "label", "enabled": true},
+    "andere.nl": {
+      "host": "192.168.1.11", "port": 443, "name": "label", "enabled": true,
+      "tls_cert": "/pad/naar/andere.nl.crt",
+      "tls_key": "/pad/naar/andere.nl.key"
+    }
   },
   "connect_timeout": 10,
   "read_timeout": 5,
   "admin_host": "0.0.0.0",
-  "admin_port": 8888
+  "admin_port": 8888,
+  "tls_cert": "/pad/naar/wildcard.crt",
+  "tls_key": "/pad/naar/wildcard.key"
 }
 ```
 
 Elke route stuurt verkeer voor dat hostname transparant door naar de opgegeven backend. TLS wordt niet getermineerd — het backend-certificaat blijft intact.
+
+### Foutpagina bij uitgeschakelde routes
+
+Als een route is uitgeschakeld, stuurt de proxy een HTML 503-pagina terug via TLS. Hiervoor moet een certificaat beschikbaar zijn dat de hostname dekt:
+
+- **Globaal cert** (`tls_cert` / `tls_key` op topniveau) — geldt als fallback voor alle routes zonder eigen cert. Typisch een wildcard-certificaat.
+- **Per-route cert** (`tls_cert` / `tls_key` op route-niveau) — overschrijft het globale cert voor die specifieke route. Gebruik dit voor domeinen die niet door het wildcard-cert gedekt worden.
+
+Is er geen geldig cert beschikbaar voor een uitgeschakelde route, dan wordt de verbinding stilletjes gesloten.
 
 ## Signalen
 

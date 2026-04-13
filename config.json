@@ -8,7 +8,9 @@
       "host": "192.168.2.76",
       "port": 8443,
       "name": "padel",
-      "enabled": true
+      "enabled": true,
+      "tls_cert": "/home/admin/ssl/freecourts/fullchain_padel.freecourts.nl.crt",
+      "tls_key": "/home/admin/ssl/freecourts/padel.freecourts.nl.key"
     },
     "thinlinc.budie.eu": {
       "host": "192.168.2.76",

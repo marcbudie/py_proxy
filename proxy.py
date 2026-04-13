@@ -57,6 +57,8 @@ class Backend:
     port: int
     name: str
     enabled: bool = True
+    tls_cert: Optional[str] = None   # per-route cert voor foutpagina's
+    tls_key: Optional[str] = None
 
 
 @dataclass
@@ -78,6 +80,8 @@ def _parse_backend(d: dict) -> Backend:
         port=d["port"],
         name=d["name"],
         enabled=d.get("enabled", True),
+        tls_cert=d.get("tls_cert"),
+        tls_key=d.get("tls_key"),
     )
 
 
@@ -112,7 +116,10 @@ def save_config(cfg: Config, path: Path) -> None:
         "listen_host": cfg.listen_host,
         "listen_ports": cfg.listen_ports,
         "tls_routes": {
-            h: {"host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
+            h: {k: v for k, v in {
+                "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
+                "tls_cert": b.tls_cert, "tls_key": b.tls_key,
+            }.items() if v is not None or k in ("host", "port", "name", "enabled")}
             for h, b in cfg.tls_routes.items()
         },
         "connect_timeout": cfg.connect_timeout,
@@ -232,11 +239,12 @@ ERROR_HTML = """\
 <div class="card">
   <h1>Route uitgeschakeld</h1>
   <p><code>{hostname}</code> is momenteel uitgeschakeld.<br>
-  Schakel de route in via de <a href="http://{admin_host}">admin UI</a>.</p>
+  Schakel de route in via de proxy admin UI.</p>
 </div>
 </body>
 </html>
 """
+
 
 
 async def send_tls_error_page(
@@ -297,7 +305,7 @@ async def handle_connection(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     cfg: Config,
-    ssl_ctx: Optional[ssl.SSLContext],
+    server: "ProxyServer",
 ) -> None:
     peer = client_writer.get_extra_info("peername") or ("?", 0)
     src = f"{peer[0]}:{peer[1]}"
@@ -325,12 +333,15 @@ async def handle_connection(
             return
 
         if not backend.enabled:
-            logger.info(f"[{src}] SNI={sni} — route disabled, sending error page")
+            ssl_ctx = server._ssl_ctx_for(backend)
             if ssl_ctx:
+                logger.info(f"[{src}] SNI={sni} — route disabled, sending error page")
                 await send_tls_error_page(
                     initial, sni, client_reader, client_writer, ssl_ctx,
                     f"{cfg.admin_host}:{cfg.admin_port}",
                 )
+            else:
+                logger.info(f"[{src}] SNI={sni} — route disabled, dropped")
             return
 
         logger.info(f"[{src}] SNI={sni:<35} → {backend.name} ({backend.host}:{backend.port})")
@@ -670,24 +681,40 @@ class ProxyServer:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
         self.cfg = load_config(config_path)
-        self._ssl_ctx = self._load_ssl_ctx()
+        self._ssl_ctxs: dict[tuple[str, str], ssl.SSLContext] = self._load_ssl_ctxs()
 
-    def _load_ssl_ctx(self) -> Optional[ssl.SSLContext]:
+    def _load_ssl_ctxs(self) -> dict[tuple[str, str], ssl.SSLContext]:
+        ctxs: dict[tuple[str, str], ssl.SSLContext] = {}
+        pairs: list[tuple[str, str]] = []
         if self.cfg.tls_cert and self.cfg.tls_key:
+            pairs.append((self.cfg.tls_cert, self.cfg.tls_key))
+        for be in self.cfg.tls_routes.values():
+            if be.tls_cert and be.tls_key:
+                pairs.append((be.tls_cert, be.tls_key))
+        for cert, key in pairs:
+            if (cert, key) in ctxs:
+                continue
             try:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ctx.load_cert_chain(self.cfg.tls_cert, self.cfg.tls_key)
-                logger.info(f"TLS cert geladen: {self.cfg.tls_cert}")
-                return ctx
+                ctx.load_cert_chain(cert, key)
+                ctxs[(cert, key)] = ctx
+                logger.info(f"TLS cert geladen: {cert}")
             except Exception as exc:
-                logger.error(f"Kon TLS cert niet laden: {exc}")
+                logger.error(f"Kon TLS cert niet laden ({cert}): {exc}")
+        return ctxs
+
+    def _ssl_ctx_for(self, backend: "Backend") -> Optional[ssl.SSLContext]:
+        if backend.tls_cert and backend.tls_key:
+            return self._ssl_ctxs.get((backend.tls_cert, backend.tls_key))
+        if self.cfg.tls_cert and self.cfg.tls_key:
+            return self._ssl_ctxs.get((self.cfg.tls_cert, self.cfg.tls_key))
         return None
 
     def reload(self) -> None:
         logger.info("SIGHUP received — reloading config")
         try:
             self.cfg = load_config(self.config_path)
-            self._ssl_ctx = self._load_ssl_ctx()
+            self._ssl_ctxs = self._load_ssl_ctxs()
             log_config(self.cfg)
         except Exception as exc:
             logger.error(f"Config reload failed: {exc} — keeping old config")
@@ -696,7 +723,7 @@ class ProxyServer:
         log_config(self.cfg)
 
         def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> asyncio.Task:
-            return asyncio.create_task(handle_connection(r, w, self.cfg, self._ssl_ctx))
+            return asyncio.create_task(handle_connection(r, w, self.cfg, self))
 
         def admin_handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> asyncio.Task:
             return asyncio.create_task(handle_admin(r, w, self))
