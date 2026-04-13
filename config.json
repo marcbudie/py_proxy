@@ -8,7 +8,7 @@
       "host": "192.168.2.76",
       "port": 8443,
       "name": "padel",
-      "enabled": false
+      "enabled": true
     },
     "thinlinc.budie.eu": {
       "host": "192.168.2.76",
