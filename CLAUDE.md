@@ -49,7 +49,22 @@ kill -TERM <pid>   # netjes stoppen
 
 ## Admin UI
 
-Bereikbaar op `http://<host>:8888/`. Toont alle routes met een toggle om ze in/uit te schakelen. Wijzigingen worden direct actief en opgeslagen in `config.json`.
+Bereikbaar op `http://<host>:8888/`. Functionaliteit:
+
+- **Aan/uit toggle** per route — direct actief, opgeslagen in `config.json`
+- **Verwijderen** per route — met bevestigingsdialoog
+- **Toevoegen** via formulier onderaan — velden: hostname, backend host, poort, label
+
+Wijzigingen worden direct actief en opgeslagen in `config.json` zonder herstart.
+
+### API-endpoints
+
+| Methode | Pad | Omschrijving |
+|---------|-----|--------------|
+| GET | `/api/routes` | Lijst van alle routes |
+| POST | `/api/routes` | Nieuwe route toevoegen (JSON body: `hostname`, `host`, `port`, `name`) |
+| POST | `/api/routes/<hostname>/toggle` | Route aan/uit schakelen |
+| DELETE | `/api/routes/<hostname>` | Route verwijderen |
 
 ## Bekende valkuilen
 
