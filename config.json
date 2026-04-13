@@ -1,0 +1,13 @@
+{
+  "listen_host": "0.0.0.0",
+  "listen_ports": [8444],
+  "tls_routes": {
+    "padel.freecourts.nl": {"host": "192.168.2.76", "port": 8443, "name": "padel", "enabled": true},
+    "home.budie.eu":       {"host": "192.168.2.76", "port": 300,  "name": "home",  "enabled": true},
+    "cockpit.budie.eu":    {"host": "192.168.2.76", "port": 9090, "name": "cockpit","enabled": true}
+  },
+  "connect_timeout": 10,
+  "read_timeout": 5,
+  "admin_host": "0.0.0.0",
+  "admin_port": 8080
+}

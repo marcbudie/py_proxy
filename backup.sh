@@ -7,7 +7,7 @@
 # Vereisten:
 #   rclone geconfigureerd met een remote genaamd 'gdrive'
 
-REMOTE="google:backup/haproxy"
+REMOTE="google:backup/py_proxy"
 SOURCE="$(cd "$(dirname "$0")" && pwd)"
 LOG="$SOURCE/backup.log"
 
