@@ -46,7 +46,7 @@ DEFAULT_CONFIG: dict = {
     "connect_timeout": 10,
     "read_timeout": 5,
     "admin_host": "0.0.0.0",
-    "admin_port": 8080,
+    "admin_port": 8888,
 }
 
 
@@ -66,7 +66,7 @@ class Config:
     connect_timeout: int
     read_timeout: int
     admin_host: str = "0.0.0.0"
-    admin_port: int = 8080
+    admin_port: int = 8888
 
 
 def _parse_backend(d: dict) -> Backend:
@@ -99,7 +99,7 @@ def load_config(path: Path) -> Config:
         connect_timeout=raw.get("connect_timeout", 10),
         read_timeout=raw.get("read_timeout", 5),
         admin_host=raw.get("admin_host", "0.0.0.0"),
-        admin_port=raw.get("admin_port", 8080),
+        admin_port=raw.get("admin_port", 8888),
     )
 
 
@@ -373,7 +373,7 @@ async function load() {
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
             <input type="checkbox" ${rt.enabled ? 'checked' : ''}
-                   onchange="toggle(${JSON.stringify(rt.hostname)}, this)">
+                   onchange='toggle(${JSON.stringify(rt.hostname)}, this)'>
             <span class="slider"></span>
           </label>
         </td>
