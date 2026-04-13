@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-TCP SNI Proxy — routes HTTPS by SNI hostname (no TLS termination).
+TCP SNI Proxy — routes HTTPS by SNI hostname (passthrough, no TLS termination)
+or by hostname + path (with TLS termination using a configured certificate).
+
+Route keys in config:
+  "hostname"        → passthrough to backend (TLS untouched)
+  "hostname/path"   → terminate TLS, route by path prefix, forward to backend
 
 Usage:
   python3 proxy.py [config.json]
@@ -13,8 +18,8 @@ Signals:
 import asyncio
 import json
 import logging
-import os
 import signal
+import ssl
 import struct
 import sys
 import time
@@ -47,6 +52,8 @@ DEFAULT_CONFIG: dict = {
     "read_timeout": 5,
     "admin_host": "0.0.0.0",
     "admin_port": 8888,
+    "tls_cert": None,
+    "tls_key": None,
 }
 
 
@@ -56,17 +63,21 @@ class Backend:
     port: int
     name: str
     enabled: bool = True
+    backend_ssl: bool = False  # connect to backend via HTTPS
+    strip_path: bool = True    # strip matched path prefix before forwarding
 
 
 @dataclass
 class Config:
     listen_host: str
     listen_ports: list[int]
-    tls_routes: dict[str, Backend]
+    tls_routes: dict[str, Backend]   # key: "hostname" or "hostname/path"
     connect_timeout: int
     read_timeout: int
     admin_host: str = "0.0.0.0"
     admin_port: int = 8888
+    tls_cert: Optional[str] = None
+    tls_key: Optional[str] = None
 
 
 def _parse_backend(d: dict) -> Backend:
@@ -75,6 +86,8 @@ def _parse_backend(d: dict) -> Backend:
         port=d["port"],
         name=d["name"],
         enabled=d.get("enabled", True),
+        backend_ssl=d.get("backend_ssl", False),
+        strip_path=d.get("strip_path", True),
     )
 
 
@@ -87,7 +100,6 @@ def load_config(path: Path) -> Config:
         path.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
         logger.info(f"No config found — wrote default to {path}")
 
-    # Accept both old "listen_port" (int) and new "listen_ports" (list)
     raw_ports = raw.get("listen_ports") or raw.get("listen_port", 443)
     if isinstance(raw_ports, int):
         raw_ports = [raw_ports]
@@ -100,6 +112,8 @@ def load_config(path: Path) -> Config:
         read_timeout=raw.get("read_timeout", 5),
         admin_host=raw.get("admin_host", "0.0.0.0"),
         admin_port=raw.get("admin_port", 8888),
+        tls_cert=raw.get("tls_cert"),
+        tls_key=raw.get("tls_key"),
     )
 
 
@@ -108,13 +122,19 @@ def save_config(cfg: Config, path: Path) -> None:
         "listen_host": cfg.listen_host,
         "listen_ports": cfg.listen_ports,
         "tls_routes": {
-            h: {"host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
+            h: {
+                "host": b.host, "port": b.port, "name": b.name,
+                "enabled": b.enabled, "backend_ssl": b.backend_ssl,
+                "strip_path": b.strip_path,
+            }
             for h, b in cfg.tls_routes.items()
         },
         "connect_timeout": cfg.connect_timeout,
         "read_timeout": cfg.read_timeout,
         "admin_host": cfg.admin_host,
         "admin_port": cfg.admin_port,
+        "tls_cert": cfg.tls_cert,
+        "tls_key": cfg.tls_key,
     }
     path.write_text(json.dumps(data, indent=2))
 
@@ -122,10 +142,61 @@ def save_config(cfg: Config, path: Path) -> None:
 def log_config(cfg: Config) -> None:
     ports = ", ".join(str(p) for p in cfg.listen_ports)
     logger.info(f"Listen: {cfg.listen_host}  ports: {ports}")
-    logger.info("TLS routes:")
-    for host, be in cfg.tls_routes.items():
+    if cfg.tls_cert:
+        logger.info(f"TLS termination cert: {cfg.tls_cert}")
+    logger.info("Routes:")
+    for key, be in cfg.tls_routes.items():
         state = "ON " if be.enabled else "OFF"
-        logger.info(f"  [{state}] {host:<35} → {be.name} ({be.host}:{be.port})")
+        mode = " [SSL→be]" if be.backend_ssl else ""
+        logger.info(f"  [{state}] {key:<45} → {be.name} ({be.host}:{be.port}){mode}")
+
+
+# ── Route index ───────────────────────────────────────────────────────────────
+
+# RouteIndex: hostname → list of (path_prefix, Backend), sorted longest-first
+RouteIndex = dict[str, list[tuple[str, "Backend"]]]
+
+
+def build_route_index(routes: dict[str, Backend]) -> RouteIndex:
+    index: RouteIndex = {}
+    for key, backend in routes.items():
+        if "/" in key:
+            hostname, suffix = key.split("/", 1)
+            path_prefix = "/" + suffix
+        else:
+            hostname = key
+            path_prefix = ""
+        index.setdefault(hostname.lower(), []).append((path_prefix, backend))
+    for hostname in index:
+        index[hostname].sort(key=lambda x: len(x[0]), reverse=True)
+    return index
+
+
+def hostname_needs_termination(hostname: str, index: RouteIndex) -> bool:
+    return any(p != "" for p, _ in index.get(hostname.lower(), []))
+
+
+def find_route(hostname: str, path: str, index: RouteIndex) -> Optional[tuple[str, Backend]]:
+    """Return (path_prefix, backend) for best match, or None."""
+    for path_prefix, backend in index.get(hostname.lower(), []):
+        if path_prefix and path.startswith(path_prefix):
+            return path_prefix, backend
+    for path_prefix, backend in index.get(hostname.lower(), []):
+        if path_prefix == "":
+            return "", backend
+    return None
+
+
+# ── SSL context ───────────────────────────────────────────────────────────────
+
+def build_ssl_ctx(cert: str, key: str) -> Optional[ssl.SSLContext]:
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        return ctx
+    except Exception as exc:
+        logger.error(f"Failed to load TLS cert/key: {exc}")
+        return None
 
 
 # ── SNI extraction ────────────────────────────────────────────────────────────
@@ -140,59 +211,122 @@ def _is_tls(data: bytes) -> bool:
 
 
 def extract_sni(data: bytes) -> Optional[str]:
-    """
-    Parse TLS ClientHello and return the SNI hostname, or None.
-    Does NOT terminate TLS — the raw bytes are forwarded untouched afterward.
-    """
     try:
         if not _is_tls(data) or len(data) < 6:
             return None
-
-        pos = 5                         # skip TLS record header (5 bytes)
-        if data[pos] != 0x01:           # must be ClientHello
+        pos = 5
+        if data[pos] != 0x01:
             return None
-        pos += 4                        # skip handshake type (1) + length (3)
-        pos += 2                        # skip client_version
-        pos += 32                       # skip random
-
+        pos += 4
+        pos += 2
+        pos += 32
         if pos >= len(data):
             return None
-        pos += 1 + data[pos]            # skip session_id
-
+        pos += 1 + data[pos]
         if pos + 2 > len(data):
             return None
         cs_len = struct.unpack("!H", data[pos: pos + 2])[0]
-        pos += 2 + cs_len               # skip cipher_suites
-
+        pos += 2 + cs_len
         if pos >= len(data):
             return None
-        pos += 1 + data[pos]            # skip compression_methods
-
+        pos += 1 + data[pos]
         if pos + 2 > len(data):
             return None
         ext_end = pos + 2 + struct.unpack("!H", data[pos: pos + 2])[0]
         pos += 2
-
         while pos + 4 <= ext_end and pos + 4 <= len(data):
             ext_type = struct.unpack("!H", data[pos: pos + 2])[0]
             ext_len  = struct.unpack("!H", data[pos + 2: pos + 4])[0]
             pos += 4
-
-            if ext_type == 0x0000:      # server_name (SNI)
+            if ext_type == 0x0000:
                 if pos + 5 <= len(data):
                     name_type = data[pos + 2]
                     name_len  = struct.unpack("!H", data[pos + 3: pos + 5])[0]
                     if name_type == 0x00 and pos + 5 + name_len <= len(data):
                         return data[pos + 5: pos + 5 + name_len].decode("ascii")
             pos += ext_len
-
         return None
-
     except Exception:
         return None
 
 
-# ── Bidirectional pipe ────────────────────────────────────────────────────────
+# ── TLS Terminator ────────────────────────────────────────────────────────────
+
+class TLSTerminator:
+    """
+    Terminates TLS on an existing asyncio stream using ssl.MemoryBIO.
+    This allows SNI extraction before the handshake by replaying the
+    already-read ClientHello bytes into the SSL engine.
+    """
+
+    def __init__(
+        self,
+        ssl_ctx: ssl.SSLContext,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self.incoming = ssl.MemoryBIO()
+        self.outgoing = ssl.MemoryBIO()
+        self.ssl_obj = ssl_ctx.wrap_bio(self.incoming, self.outgoing, server_side=True)
+        self._reader = reader
+        self._writer = writer
+
+    async def do_handshake(self, initial_data: bytes) -> None:
+        """Complete TLS handshake; initial_data is the already-read ClientHello."""
+        self.incoming.write(initial_data)
+        while True:
+            try:
+                self.ssl_obj.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                await self._flush()
+                more = await asyncio.wait_for(self._reader.read(16384), timeout=10)
+                if not more:
+                    raise ConnectionError("Client closed during TLS handshake")
+                self.incoming.write(more)
+            except ssl.SSLWantWriteError:
+                await self._flush()
+        await self._flush()
+
+    async def _flush(self) -> None:
+        if self.outgoing.pending:
+            self._writer.write(self.outgoing.read())
+            await self._writer.drain()
+
+    async def read(self, n: int = 16384, timeout: Optional[float] = None) -> bytes:
+        while True:
+            try:
+                return self.ssl_obj.read(n)
+            except ssl.SSLWantReadError:
+                try:
+                    coro = self._reader.read(16384)
+                    more = await (asyncio.wait_for(coro, timeout=timeout) if timeout else coro)
+                except asyncio.TimeoutError:
+                    return b""
+                if not more:
+                    return b""
+                self.incoming.write(more)
+            except ssl.SSLZeroReturnError:
+                return b""
+
+    async def write(self, data: bytes) -> None:
+        self.ssl_obj.write(data)
+        await self._flush()
+
+    async def close(self) -> None:
+        try:
+            self.ssl_obj.unwrap()
+            await self._flush()
+        except Exception:
+            pass
+        try:
+            self._writer.close()
+            await self._writer.wait_closed()
+        except Exception:
+            pass
+
+
+# ── Passthrough pipe ──────────────────────────────────────────────────────────
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label: str) -> int:
     total = 0
@@ -207,7 +341,7 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label
     except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
         pass
     except Exception as exc:
-        logger.debug(f"  pipe {label}: {exc}")
+        logger.debug(f"pipe {label}: {exc}")
     finally:
         try:
             writer.close()
@@ -217,12 +351,175 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label
     return total
 
 
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def rewrite_http_request(
+    headers_bytes: bytes,
+    path_prefix: str,
+    strip_path: bool,
+    backend_host: str,
+    backend_port: int,
+) -> bytes:
+    """Rewrite request line (strip path prefix) and Host header."""
+    try:
+        text = headers_bytes.decode("utf-8", errors="replace")
+        lines = text.split("\r\n")
+        parts = lines[0].split(" ", 2)
+        if len(parts) >= 2:
+            method, path = parts[0], parts[1]
+            version = parts[2] if len(parts) > 2 else "HTTP/1.1"
+            if strip_path and path_prefix and path.startswith(path_prefix):
+                new_path = path[len(path_prefix):]
+                if not new_path.startswith("/"):
+                    new_path = "/" + new_path
+                path = new_path or "/"
+            lines[0] = f"{method} {path} {version}"
+        new_lines = []
+        for line in lines:
+            if line.lower().startswith("host:"):
+                new_lines.append(f"Host: {backend_host}:{backend_port}")
+            else:
+                new_lines.append(line)
+        return "\r\n".join(new_lines).encode("utf-8")
+    except Exception:
+        return headers_bytes
+
+
+# ── Terminated connection handler ─────────────────────────────────────────────
+
+async def handle_terminated(
+    tls: TLSTerminator,
+    sni: str,
+    cfg: Config,
+    route_index: RouteIndex,
+    src: str,
+    started: float,
+) -> None:
+    up = down = 0
+    try:
+        # Read HTTP request headers
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = await tls.read(4096, timeout=cfg.read_timeout)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > 65536:
+                logger.warning(f"[{src}] HTTP headers too large — dropped")
+                return
+
+        sep = buf.index(b"\r\n\r\n")
+        headers_data = buf[: sep + 4]
+        leftover = buf[sep + 4:]
+
+        # Parse path for routing (strip query string)
+        first_line = headers_data.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+        req_parts = first_line.split(" ", 2)
+        method = req_parts[0] if req_parts else "GET"
+        full_path = req_parts[1] if len(req_parts) > 1 else "/"
+        path_only = full_path.split("?")[0]
+
+        result = find_route(sni, path_only, route_index)
+        if result is None:
+            logger.warning(f"[{src}] SNI={sni} {method} {full_path} — no route, dropped")
+            await tls.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return
+
+        path_prefix, backend = result
+        if not backend.enabled:
+            logger.warning(f"[{src}] SNI={sni} {method} {full_path} — route disabled")
+            await tls.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return
+
+        logger.info(f"[{src}] SNI={sni} {method} {full_path:<30} → {backend.name} ({backend.host}:{backend.port})")
+
+        new_headers = rewrite_http_request(
+            headers_data, path_prefix, backend.strip_path, backend.host, backend.port
+        )
+
+        # Connect to backend
+        try:
+            if backend.backend_ssl:
+                be_ctx = ssl.create_default_context()
+                be_ctx.check_hostname = False
+                be_ctx.verify_mode = ssl.CERT_NONE
+                be_reader, be_writer = await asyncio.wait_for(
+                    asyncio.open_connection(backend.host, backend.port, ssl=be_ctx),
+                    timeout=cfg.connect_timeout,
+                )
+            else:
+                be_reader, be_writer = await asyncio.wait_for(
+                    asyncio.open_connection(backend.host, backend.port),
+                    timeout=cfg.connect_timeout,
+                )
+        except asyncio.TimeoutError:
+            logger.error(f"[{src}] connect timeout → {backend.name}")
+            await tls.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return
+        except OSError as exc:
+            logger.error(f"[{src}] cannot connect → {backend.name}: {exc}")
+            await tls.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return
+
+        be_writer.write(new_headers)
+        if leftover:
+            be_writer.write(leftover)
+        await be_writer.drain()
+
+        # Bidirectional pipe: client (decrypted) ↔ backend
+        async def client_to_be() -> None:
+            nonlocal up
+            try:
+                while True:
+                    data = await tls.read(65536)
+                    if not data:
+                        break
+                    be_writer.write(data)
+                    await be_writer.drain()
+                    up += len(data)
+            except Exception:
+                pass
+            finally:
+                try:
+                    be_writer.close()
+                    await be_writer.wait_closed()
+                except Exception:
+                    pass
+
+        async def be_to_client() -> None:
+            nonlocal down
+            try:
+                while True:
+                    data = await be_reader.read(65536)
+                    if not data:
+                        break
+                    await tls.write(data)
+                    down += len(data)
+            except Exception:
+                pass
+
+        await asyncio.gather(client_to_be(), be_to_client())
+
+        elapsed = time.monotonic() - started
+        logger.info(
+            f"[{src}] closed  SNI={sni} {method} {full_path} → {backend.name} "
+            f"↑{_fmt_bytes(up)} ↓{_fmt_bytes(down)} {elapsed:.1f}s"
+        )
+
+    except Exception as exc:
+        logger.exception(f"[{src}] terminated handler error: {exc}")
+    finally:
+        await tls.close()
+
+
 # ── Connection handler ────────────────────────────────────────────────────────
 
 async def handle_connection(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     cfg: Config,
+    route_index: RouteIndex,
+    ssl_ctx: Optional[ssl.SSLContext],
 ) -> None:
     peer = client_writer.get_extra_info("peername") or ("?", 0)
     src = f"{peer[0]}:{peer[1]}"
@@ -230,10 +527,7 @@ async def handle_connection(
 
     try:
         try:
-            initial = await asyncio.wait_for(
-                client_reader.read(4096),
-                timeout=cfg.read_timeout,
-            )
+            initial = await asyncio.wait_for(client_reader.read(4096), timeout=cfg.read_timeout)
         except asyncio.TimeoutError:
             logger.warning(f"[{src}] timeout waiting for initial data — dropped")
             return
@@ -246,10 +540,26 @@ async def handle_connection(
             logger.warning(f"[{src}] no SNI — dropped")
             return
 
-        backend = cfg.tls_routes.get(sni.lower())
-        if not backend:
+        # ── Path-based routing: terminate TLS ─────────────────────────────────
+        if hostname_needs_termination(sni, route_index):
+            if not ssl_ctx:
+                logger.error(f"[{src}] SNI={sni} needs TLS termination but no cert configured")
+                return
+            tls = TLSTerminator(ssl_ctx, client_reader, client_writer)
+            try:
+                await tls.do_handshake(initial)
+            except Exception as exc:
+                logger.warning(f"[{src}] TLS handshake failed for {sni}: {exc}")
+                return
+            await handle_terminated(tls, sni, cfg, route_index, src, started)
+            return
+
+        # ── Hostname-only routing: passthrough ────────────────────────────────
+        result = find_route(sni, "", route_index)
+        if result is None:
             logger.warning(f"[{src}] SNI={sni} — no route configured, dropped")
             return
+        _, backend = result
 
         if not backend.enabled:
             logger.warning(f"[{src}] SNI={sni} — route disabled, dropped")
@@ -274,7 +584,7 @@ async def handle_connection(
 
         up, down = await asyncio.gather(
             pipe(client_reader, be_writer, f"{src}→{backend.name}"),
-            pipe(be_reader,     client_writer, f"{backend.name}→{src}"),
+            pipe(be_reader, client_writer, f"{backend.name}→{src}"),
         )
 
         elapsed = time.monotonic() - started
@@ -314,7 +624,7 @@ ADMIN_HTML = """\
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #f0f2f5; padding: 2rem; color: #222; }
   h1 { margin-bottom: 1.5rem; font-size: 1.4rem; font-weight: 600; }
-  table { width: 100%; max-width: 750px; border-collapse: collapse; background: #fff;
+  table { width: 100%; max-width: 900px; border-collapse: collapse; background: #fff;
           border-radius: 10px; overflow: hidden; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
   th { background: #f7f7f7; padding: .7rem 1.2rem; text-align: left; font-size: .8rem;
        color: #888; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #eee; }
@@ -326,7 +636,7 @@ ADMIN_HTML = """\
            font-size: .78rem; font-weight: 600; }
   .badge-on  { background: #dcf5e7; color: #1a7a40; }
   .badge-off { background: #fde8e8; color: #b91c1c; }
-  /* Toggle switch */
+  .badge-mode { background: #e0e7ff; color: #3730a3; margin-left: .3rem; }
   .toggle { position: relative; display: inline-block; width: 46px; height: 26px; }
   .toggle input { opacity: 0; width: 0; height: 0; }
   .slider { position: absolute; cursor: pointer; inset: 0; background: #d1d5db;
@@ -337,7 +647,7 @@ ADMIN_HTML = """\
   input:checked + .slider { background: #22c55e; }
   input:checked + .slider:before { transform: translateX(20px); }
   input:disabled + .slider { opacity: .5; cursor: wait; }
-  .msg { margin-top: 1rem; max-width: 750px; padding: .7rem 1rem; border-radius: 8px;
+  .msg { margin-top: 1rem; max-width: 900px; padding: .7rem 1rem; border-radius: 8px;
          font-size: .88rem; display: none; }
   .msg-ok  { background: #dcf5e7; color: #166534; }
   .msg-err { background: #fde8e8; color: #991b1b; }
@@ -348,7 +658,7 @@ ADMIN_HTML = """\
 <table>
   <thead>
     <tr>
-      <th>Hostname</th>
+      <th>Route</th>
       <th>Backend</th>
       <th>Status</th>
       <th>Aan / Uit</th>
@@ -366,14 +676,18 @@ async function load() {
     const r = await fetch('/api/routes');
     const routes = await r.json();
     document.getElementById('tbody').innerHTML = routes.map(rt => `
-      <tr id="row-${CSS.escape(rt.hostname)}">
-        <td class="host">${esc(rt.hostname)}</td>
-        <td class="backend">${esc(rt.name)} &rarr; ${esc(rt.host)}:${rt.port}</td>
+      <tr>
+        <td class="host">${esc(rt.route_key)}</td>
+        <td class="backend">
+          ${esc(rt.name)} &rarr; ${esc(rt.host)}:${rt.port}
+          ${rt.backend_ssl ? '<span class="badge badge-mode">HTTPS</span>' : ''}
+          ${rt.route_key.includes('/') ? '<span class="badge badge-mode">pad</span>' : ''}
+        </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
             <input type="checkbox" ${rt.enabled ? 'checked' : ''}
-                   onchange='toggle(${JSON.stringify(rt.hostname)}, this)'>
+                   onchange='toggle(${JSON.stringify(rt.route_key)}, this)'>
             <span class="slider"></span>
           </label>
         </td>
@@ -384,17 +698,17 @@ async function load() {
   }
 }
 
-async function toggle(hostname, el) {
+async function toggle(routeKey, el) {
   el.disabled = true;
   try {
-    const r = await fetch('/api/routes/' + encodeURIComponent(hostname) + '/toggle', {method: 'POST'});
+    const r = await fetch('/api/routes/' + encodeURIComponent(routeKey) + '/toggle', {method: 'POST'});
     if (!r.ok) {
       el.checked = !el.checked;
-      showMsg('Fout bij omschakelen van ' + hostname, false);
+      showMsg('Fout bij omschakelen van ' + routeKey, false);
       return;
     }
     const data = await r.json();
-    showMsg(`${hostname} is nu ${data.enabled ? 'ingeschakeld' : 'uitgeschakeld'}.`, true);
+    showMsg(`${routeKey} is nu ${data.enabled ? 'ingeschakeld' : 'uitgeschakeld'}.`, true);
     await load();
   } catch (e) {
     el.checked = !el.checked;
@@ -414,7 +728,7 @@ function showMsg(text, ok) {
 }
 
 function esc(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 load();
@@ -430,20 +744,14 @@ async def handle_admin(
     proxy_server: "ProxyServer",
 ) -> None:
     try:
-        # Read request line
         request_line = await asyncio.wait_for(reader.readline(), timeout=10)
         if not request_line:
             return
-
         parts = request_line.decode("utf-8", errors="replace").strip().split()
         if len(parts) < 2:
             return
-        method, path = parts[0].upper(), parts[1]
+        method, path = parts[0].upper(), parts[1].split("?")[0]
 
-        # Strip query string
-        path = path.split("?")[0]
-
-        # Read headers
         content_length = 0
         while True:
             line = await asyncio.wait_for(reader.readline(), timeout=10)
@@ -454,55 +762,47 @@ async def handle_admin(
                     content_length = int(line.split(b":")[1].strip())
                 except ValueError:
                     pass
-
-        # Read body (if any)
         if content_length > 0:
             await asyncio.wait_for(reader.read(min(content_length, 4096)), timeout=10)
 
         def respond(status: int, content_type: str, body: bytes) -> None:
-            status_text = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed"}.get(status, "")
-            header = (
+            status_text = {200: "OK", 400: "Bad Request", 404: "Not Found"}.get(status, "")
+            writer.write((
                 f"HTTP/1.1 {status} {status_text}\r\n"
                 f"Content-Type: {content_type}\r\n"
                 f"Content-Length: {len(body)}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-            ).encode()
-            writer.write(header + body)
+                f"Connection: close\r\n\r\n"
+            ).encode() + body)
 
-        # ── GET / ─────────────────────────────────────────────────────────────
         if method == "GET" and path == "/":
             respond(200, "text/html; charset=utf-8", ADMIN_HTML.encode("utf-8"))
 
-        # ── GET /api/routes ───────────────────────────────────────────────────
         elif method == "GET" and path == "/api/routes":
             routes = [
                 {
-                    "hostname": h,
-                    "host": b.host,
-                    "port": b.port,
-                    "name": b.name,
-                    "enabled": b.enabled,
+                    "route_key": k,
+                    "host": b.host, "port": b.port, "name": b.name,
+                    "enabled": b.enabled, "backend_ssl": b.backend_ssl,
                 }
-                for h, b in proxy_server.cfg.tls_routes.items()
+                for k, b in proxy_server.cfg.tls_routes.items()
             ]
             respond(200, "application/json", json.dumps(routes).encode())
 
-        # ── POST /api/routes/<hostname>/toggle ────────────────────────────────
         elif method == "POST" and path.startswith("/api/routes/") and path.endswith("/toggle"):
             segments = path.strip("/").split("/")
-            # segments: ['api', 'routes', '<hostname>', 'toggle']
-            if len(segments) == 4 and segments[0] == "api" and segments[1] == "routes":
-                hostname = urllib.parse.unquote(segments[2])
-                backend = proxy_server.cfg.tls_routes.get(hostname)
+            # segments: ['api', 'routes', '<route_key>', 'toggle']
+            if len(segments) >= 4 and segments[0] == "api" and segments[1] == "routes":
+                route_key = urllib.parse.unquote("/".join(segments[2:-1]))
+                backend = proxy_server.cfg.tls_routes.get(route_key)
                 if backend is None:
                     respond(404, "application/json", json.dumps({"error": "route not found"}).encode())
                 else:
                     backend.enabled = not backend.enabled
+                    proxy_server._route_index = build_route_index(proxy_server.cfg.tls_routes)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
-                    logger.info(f"Route {hostname} {state} via admin UI")
-                    respond(200, "application/json", json.dumps({"hostname": hostname, "enabled": backend.enabled}).encode())
+                    logger.info(f"Route {route_key} {state} via admin UI")
+                    respond(200, "application/json", json.dumps({"route_key": route_key, "enabled": backend.enabled}).encode())
             else:
                 respond(400, "application/json", json.dumps({"error": "bad request"}).encode())
 
@@ -527,11 +827,20 @@ class ProxyServer:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
         self.cfg = load_config(config_path)
+        self._route_index = build_route_index(self.cfg.tls_routes)
+        self._ssl_ctx = self._load_ssl_ctx()
+
+    def _load_ssl_ctx(self) -> Optional[ssl.SSLContext]:
+        if self.cfg.tls_cert and self.cfg.tls_key:
+            return build_ssl_ctx(self.cfg.tls_cert, self.cfg.tls_key)
+        return None
 
     def reload(self) -> None:
         logger.info("SIGHUP received — reloading config")
         try:
             self.cfg = load_config(self.config_path)
+            self._route_index = build_route_index(self.cfg.tls_routes)
+            self._ssl_ctx = self._load_ssl_ctx()
             log_config(self.cfg)
         except Exception as exc:
             logger.error(f"Config reload failed: {exc} — keeping old config")
@@ -540,7 +849,9 @@ class ProxyServer:
         log_config(self.cfg)
 
         def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> asyncio.Task:
-            return asyncio.create_task(handle_connection(r, w, self.cfg))
+            return asyncio.create_task(
+                handle_connection(r, w, self.cfg, self._route_index, self._ssl_ctx)
+            )
 
         def admin_handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> asyncio.Task:
             return asyncio.create_task(handle_admin(r, w, self))
@@ -575,13 +886,6 @@ def main() -> None:
         sys.exit(0)
 
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("config.json")
-
-    default_ports = DEFAULT_CONFIG.get("listen_ports", [443])
-    if os.geteuid() != 0 and any(p < 1024 for p in default_ports):
-        logger.warning(
-            "Running as non-root on a privileged port may fail. "
-            "Use: sudo setcap cap_net_bind_service+ep $(which python3)"
-        )
 
     server = ProxyServer(config_path)
     try:
