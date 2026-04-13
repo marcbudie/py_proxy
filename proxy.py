@@ -299,29 +299,40 @@ ADMIN_HTML = """\
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #f0f2f5; padding: 2rem; color: #222; }
   h1 { margin-bottom: 1.5rem; font-size: 1.4rem; font-weight: 600; }
-  table { width: 100%; max-width: 750px; border-collapse: collapse; background: #fff;
+  table { width: 100%; max-width: 800px; border-collapse: collapse; background: #fff;
           border-radius: 10px; overflow: hidden; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
   th { background: #f7f7f7; padding: .7rem 1.2rem; text-align: left; font-size: .8rem;
        color: #888; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #eee; }
-  td { padding: .85rem 1.2rem; border-top: 1px solid #f0f0f0; font-size: .9rem; vertical-align: middle; }
+  td { padding: .75rem 1.2rem; border-top: 1px solid #f0f0f0; font-size: .9rem; vertical-align: middle; }
   tr:first-child td { border-top: none; }
   .host { font-family: monospace; font-size: .88rem; }
   .backend { color: #777; font-size: .82rem; font-family: monospace; }
-  .badge { display: inline-block; padding: .2rem .65rem; border-radius: 20px;
-           font-size: .78rem; font-weight: 600; }
+  .badge { display: inline-block; padding: .2rem .65rem; border-radius: 20px; font-size: .78rem; font-weight: 600; }
   .badge-on  { background: #dcf5e7; color: #1a7a40; }
   .badge-off { background: #fde8e8; color: #b91c1c; }
   .toggle { position: relative; display: inline-block; width: 46px; height: 26px; }
   .toggle input { opacity: 0; width: 0; height: 0; }
-  .slider { position: absolute; cursor: pointer; inset: 0; background: #d1d5db;
-            border-radius: 26px; transition: background .2s; }
-  .slider:before { position: absolute; content: ""; height: 20px; width: 20px;
-                   left: 3px; bottom: 3px; background: #fff; border-radius: 50%;
-                   transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.2); }
+  .slider { position: absolute; cursor: pointer; inset: 0; background: #d1d5db; border-radius: 26px; transition: background .2s; }
+  .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px;
+                   background: #fff; border-radius: 50%; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.2); }
   input:checked + .slider { background: #22c55e; }
   input:checked + .slider:before { transform: translateX(20px); }
   input:disabled + .slider { opacity: .5; cursor: wait; }
-  .msg { margin-top: 1rem; max-width: 750px; padding: .7rem 1rem; border-radius: 8px;
+  .btn-del { background: none; border: 1px solid #fca5a5; color: #dc2626; border-radius: 6px;
+             padding: .25rem .6rem; font-size: .8rem; cursor: pointer; }
+  .btn-del:hover { background: #fef2f2; }
+  /* Add form */
+  .add-card { margin-top: 1.5rem; max-width: 800px; background: #fff; border-radius: 10px;
+              padding: 1.25rem 1.5rem; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
+  .add-card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }
+  .fields { display: grid; grid-template-columns: 2fr 2fr 1fr 1fr; gap: .6rem; }
+  .fields input { padding: .45rem .7rem; border: 1px solid #d1d5db; border-radius: 6px;
+                  font-size: .88rem; width: 100%; }
+  .fields input:focus { outline: 2px solid #6366f1; border-color: transparent; }
+  .btn-add { margin-top: .75rem; padding: .5rem 1.2rem; background: #6366f1; color: #fff;
+             border: none; border-radius: 6px; font-size: .9rem; cursor: pointer; }
+  .btn-add:hover { background: #4f46e5; }
+  .msg { margin-top: 1rem; max-width: 800px; padding: .7rem 1rem; border-radius: 8px;
          font-size: .88rem; display: none; }
   .msg-ok  { background: #dcf5e7; color: #166534; }
   .msg-err { background: #fde8e8; color: #991b1b; }
@@ -336,12 +347,25 @@ ADMIN_HTML = """\
       <th>Backend</th>
       <th>Status</th>
       <th>Aan / Uit</th>
+      <th></th>
     </tr>
   </thead>
   <tbody id="tbody">
-    <tr><td colspan="4" style="color:#aaa;padding:1.5rem">Laden&hellip;</td></tr>
+    <tr><td colspan="5" style="color:#aaa;padding:1.5rem">Laden&hellip;</td></tr>
   </tbody>
 </table>
+
+<div class="add-card">
+  <h2>Route toevoegen</h2>
+  <div class="fields">
+    <input id="f-hostname" placeholder="hostname (bijv. app.budie.eu)" autocomplete="off">
+    <input id="f-host"     placeholder="backend host (bijv. 192.168.2.10)" autocomplete="off">
+    <input id="f-port"     placeholder="poort" type="number" min="1" max="65535" autocomplete="off">
+    <input id="f-name"     placeholder="label" autocomplete="off">
+  </div>
+  <button class="btn-add" onclick="addRoute()">Toevoegen</button>
+</div>
+
 <div id="msg" class="msg"></div>
 
 <script>
@@ -349,7 +373,7 @@ async function load() {
   try {
     const r = await fetch('/api/routes');
     const routes = await r.json();
-    document.getElementById('tbody').innerHTML = routes.map(rt => `
+    document.getElementById('tbody').innerHTML = routes.length ? routes.map(rt => `
       <tr>
         <td class="host">${esc(rt.hostname)}</td>
         <td class="backend">${esc(rt.name)} &rarr; ${esc(rt.host)}:${rt.port}</td>
@@ -361,8 +385,9 @@ async function load() {
             <span class="slider"></span>
           </label>
         </td>
+        <td><button class="btn-del" onclick='remove(${JSON.stringify(rt.hostname)})'>Verwijder</button></td>
       </tr>
-    `).join('');
+    `).join('') : '<tr><td colspan="5" style="color:#aaa;padding:1.5rem">Geen routes geconfigureerd.</td></tr>';
   } catch (e) {
     showMsg('Kon routes niet laden: ' + e, false);
   }
@@ -372,20 +397,50 @@ async function toggle(hostname, el) {
   el.disabled = true;
   try {
     const r = await fetch('/api/routes/' + encodeURIComponent(hostname) + '/toggle', {method: 'POST'});
-    if (!r.ok) {
-      el.checked = !el.checked;
-      showMsg('Fout bij omschakelen van ' + hostname, false);
-      return;
-    }
+    if (!r.ok) { el.checked = !el.checked; showMsg('Fout bij omschakelen van ' + hostname, false); return; }
     const data = await r.json();
     showMsg(`${hostname} is nu ${data.enabled ? 'ingeschakeld' : 'uitgeschakeld'}.`, true);
     await load();
   } catch (e) {
     el.checked = !el.checked;
     showMsg('Netwerkfout: ' + e, false);
-  } finally {
-    el.disabled = false;
-  }
+  } finally { el.disabled = false; }
+}
+
+async function remove(hostname) {
+  if (!confirm(`Route "${hostname}" verwijderen?`)) return;
+  try {
+    const r = await fetch('/api/routes/' + encodeURIComponent(hostname), {method: 'DELETE'});
+    if (!r.ok) { showMsg('Verwijderen mislukt.', false); return; }
+    showMsg(`${hostname} verwijderd.`, true);
+    await load();
+  } catch (e) { showMsg('Netwerkfout: ' + e, false); }
+}
+
+async function addRoute() {
+  const hostname = document.getElementById('f-hostname').value.trim().toLowerCase();
+  const host     = document.getElementById('f-host').value.trim();
+  const port     = parseInt(document.getElementById('f-port').value, 10);
+  const name     = document.getElementById('f-name').value.trim();
+  if (!hostname || !host || !port || !name) { showMsg('Vul alle velden in.', false); return; }
+  try {
+    const r = await fetch('/api/routes', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hostname, host, port, name}),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      showMsg(d.error || 'Toevoegen mislukt.', false);
+      return;
+    }
+    showMsg(`${hostname} toegevoegd.`, true);
+    document.getElementById('f-hostname').value = '';
+    document.getElementById('f-host').value = '';
+    document.getElementById('f-port').value = '';
+    document.getElementById('f-name').value = '';
+    await load();
+  } catch (e) { showMsg('Netwerkfout: ' + e, false); }
 }
 
 function showMsg(text, ok) {
@@ -432,8 +487,9 @@ async def handle_admin(
                     content_length = int(line.split(b":")[1].strip())
                 except ValueError:
                     pass
+        body = b""
         if content_length > 0:
-            await asyncio.wait_for(reader.read(min(content_length, 4096)), timeout=10)
+            body = await asyncio.wait_for(reader.read(min(content_length, 4096)), timeout=10)
 
         def respond(status: int, content_type: str, body: bytes) -> None:
             status_text = {200: "OK", 400: "Bad Request", 404: "Not Found"}.get(status, "")
@@ -453,6 +509,36 @@ async def handle_admin(
                 for h, b in proxy_server.cfg.tls_routes.items()
             ]
             respond(200, "application/json", json.dumps(routes).encode())
+
+        elif method == "POST" and path == "/api/routes":
+            try:
+                data = json.loads(body)
+                hostname = data["hostname"].strip().lower()
+                host     = data["host"].strip()
+                port     = int(data["port"])
+                name     = data["name"].strip()
+                if not hostname or not host or not name or not (1 <= port <= 65535):
+                    raise ValueError("invalid fields")
+            except Exception:
+                respond(400, "application/json", json.dumps({"error": "ongeldige invoer"}).encode())
+            else:
+                if hostname in proxy_server.cfg.tls_routes:
+                    respond(400, "application/json", json.dumps({"error": "hostname bestaat al"}).encode())
+                else:
+                    proxy_server.cfg.tls_routes[hostname] = Backend(host=host, port=port, name=name)
+                    save_config(proxy_server.cfg, proxy_server.config_path)
+                    logger.info(f"Route {hostname} → {name} ({host}:{port}) toegevoegd via admin UI")
+                    respond(200, "application/json", json.dumps({"hostname": hostname}).encode())
+
+        elif method == "DELETE" and path.startswith("/api/routes/"):
+            hostname = urllib.parse.unquote(path[len("/api/routes/"):])
+            if hostname not in proxy_server.cfg.tls_routes:
+                respond(404, "application/json", json.dumps({"error": "route not found"}).encode())
+            else:
+                del proxy_server.cfg.tls_routes[hostname]
+                save_config(proxy_server.cfg, proxy_server.config_path)
+                logger.info(f"Route {hostname} verwijderd via admin UI")
+                respond(200, "application/json", json.dumps({"hostname": hostname}).encode())
 
         elif method == "POST" and path.startswith("/api/routes/") and path.endswith("/toggle"):
             segments = path.strip("/").split("/")
