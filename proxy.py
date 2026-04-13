@@ -18,6 +18,7 @@ Signals:
 import asyncio
 import json
 import logging
+import re
 import signal
 import ssl
 import struct
@@ -63,8 +64,9 @@ class Backend:
     port: int
     name: str
     enabled: bool = True
-    backend_ssl: bool = False  # connect to backend via HTTPS
-    strip_path: bool = True    # strip matched path prefix before forwarding
+    backend_ssl: bool = False    # connect to backend via HTTPS
+    strip_path: bool = True      # strip matched path prefix before forwarding
+    rewrite_paths: bool = False  # rewrite Location/HTML paths in responses
 
 
 @dataclass
@@ -88,6 +90,7 @@ def _parse_backend(d: dict) -> Backend:
         enabled=d.get("enabled", True),
         backend_ssl=d.get("backend_ssl", False),
         strip_path=d.get("strip_path", True),
+        rewrite_paths=d.get("rewrite_paths", False),
     )
 
 
@@ -125,7 +128,7 @@ def save_config(cfg: Config, path: Path) -> None:
             h: {
                 "host": b.host, "port": b.port, "name": b.name,
                 "enabled": b.enabled, "backend_ssl": b.backend_ssl,
-                "strip_path": b.strip_path,
+                "strip_path": b.strip_path, "rewrite_paths": b.rewrite_paths,
             }
             for h, b in cfg.tls_routes.items()
         },
@@ -385,6 +388,299 @@ def rewrite_http_request(
         return headers_bytes
 
 
+# ── Response rewriting ────────────────────────────────────────────────────────
+
+def _rewrite_html_body(body: bytes, prefix: str) -> bytes:
+    """Prefix all absolute paths in HTML with prefix (e.g. /pfsense)."""
+    try:
+        text = body.decode("utf-8", errors="replace")
+        esc = re.escape(prefix)
+        # href="/...", src="/...", action="/..."  — skip if already prefixed
+        text = re.sub(
+            r'(?i)((?:href|src|action|data-url)\s*=\s*["\'])(/(?!' + esc[1:] + r'/))',
+            lambda m: m.group(1) + prefix + m.group(2),
+            text,
+        )
+        # window.location = "/..." or location.href = "/..."
+        text = re.sub(
+            r"""((?:window\.location|location\.href)\s*=\s*['"])(/(?!""" + esc[1:] + r"/)')",
+            lambda m: m.group(1) + prefix + m.group(2),
+            text,
+        )
+        return text.encode("utf-8")
+    except Exception:
+        return body
+
+
+def _decode_chunked(data: bytes) -> bytes:
+    """Decode HTTP chunked transfer encoding."""
+    out = bytearray()
+    pos = 0
+    try:
+        while pos < len(data):
+            end = data.index(b"\r\n", pos)
+            size = int(data[pos:end], 16)
+            if size == 0:
+                break
+            pos = end + 2
+            out.extend(data[pos: pos + size])
+            pos += size + 2  # skip trailing \r\n
+    except Exception:
+        pass
+    return bytes(out)
+
+
+def _parse_response_headers(
+    headers_data: bytes, prefix: str
+) -> tuple[list[str], bool, int, bool]:
+    """
+    Parse and rewrite response headers.
+    Returns (lines, is_html, content_length, is_chunked).
+    """
+    lines = headers_data.decode("utf-8", errors="replace").rstrip("\r\n").split("\r\n")
+    new_lines = [lines[0]]
+    is_html = False
+    content_length = -1
+    is_chunked = False
+
+    for line in lines[1:]:
+        lower = line.lower()
+        if lower.startswith("location:"):
+            val = line.split(":", 1)[1].strip()
+            if val.startswith("/") and not val.startswith(prefix):
+                line = f"Location: {prefix}{val}"
+        elif lower.startswith("set-cookie:") and "path=/" in lower:
+            line = re.sub(
+                r"(?i)(;\s*path=)(/)(?!" + re.escape(prefix[1:]) + r"/)",
+                lambda m: m.group(1) + prefix + m.group(2),
+                line,
+            )
+        elif lower.startswith("content-type:") and "text/html" in lower:
+            is_html = True
+        elif lower.startswith("content-length:"):
+            try:
+                content_length = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif lower.startswith("transfer-encoding:") and "chunked" in lower:
+            is_chunked = True
+        new_lines.append(line)
+
+    return new_lines, is_html, content_length, is_chunked
+
+
+async def _proxy_response(
+    be_reader: asyncio.StreamReader,
+    tls: "TLSTerminator",
+    prefix: str,
+) -> tuple[int, bool]:
+    """
+    Read one HTTP response from backend, rewrite if needed, send to client.
+    Returns (bytes_sent, keep_alive).
+    """
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = await be_reader.read(4096)
+        if not chunk:
+            if buf:
+                await tls.write(buf)
+            return len(buf), False
+        buf += chunk
+
+    sep = buf.index(b"\r\n\r\n")
+    headers_data = buf[: sep + 4]
+    remainder = buf[sep + 4:]
+
+    new_lines, is_html, content_length, is_chunked = _parse_response_headers(headers_data, prefix)
+
+    # Determine keep-alive from status + headers
+    status_code = 0
+    try:
+        status_code = int(new_lines[0].split()[1])
+    except Exception:
+        pass
+    keep_alive = status_code not in (204, 304)
+    for line in new_lines[1:]:
+        if line.lower().startswith("connection:") and "close" in line.lower():
+            keep_alive = False
+
+    # No body for 1xx, 204, 304
+    if status_code in (204, 304) or (100 <= status_code < 200):
+        await tls.write("\r\n".join(new_lines).encode("utf-8"))
+        return 0, False
+
+    if is_html:
+        # Read full body to rewrite it
+        body = remainder
+        if content_length >= 0:
+            remaining = content_length - len(remainder)
+            while remaining > 0:
+                chunk = await be_reader.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                body += chunk
+                remaining -= len(chunk)
+        elif is_chunked:
+            raw = remainder
+            while not (b"\r\n0\r\n\r\n" in raw or raw.endswith(b"0\r\n\r\n")):
+                chunk = await be_reader.read(65536)
+                if not chunk:
+                    break
+                raw += chunk
+            body = _decode_chunked(raw)
+            is_chunked = False
+        else:
+            while True:
+                chunk = await be_reader.read(65536)
+                if not chunk:
+                    break
+                body += chunk
+            keep_alive = False
+
+        body = _rewrite_html_body(body, prefix)
+
+        final_lines = []
+        has_cl = False
+        for line in new_lines:
+            if line.lower().startswith("transfer-encoding:"):
+                continue
+            if line.lower().startswith("content-length:"):
+                final_lines.append(f"Content-Length: {len(body)}")
+                has_cl = True
+            else:
+                final_lines.append(line)
+        if not has_cl:
+            final_lines.insert(1, f"Content-Length: {len(body)}")
+
+        await tls.write("\r\n".join(final_lines).encode("utf-8"))
+        await tls.write(body)
+        return len(body), keep_alive
+
+    else:
+        # Non-HTML: stream body, headers already rewritten
+        await tls.write("\r\n".join(new_lines).encode("utf-8"))
+        total = 0
+
+        if content_length >= 0:
+            await tls.write(remainder)
+            total += len(remainder)
+            remaining = content_length - len(remainder)
+            while remaining > 0:
+                chunk = await be_reader.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                await tls.write(chunk)
+                total += len(chunk)
+                remaining -= len(chunk)
+        elif is_chunked:
+            await tls.write(remainder)
+            total += len(remainder)
+            while not (b"\r\n0\r\n\r\n" in remainder or remainder.endswith(b"0\r\n\r\n")):
+                remainder = await be_reader.read(65536)
+                if not remainder:
+                    break
+                await tls.write(remainder)
+                total += len(remainder)
+        else:
+            await tls.write(remainder)
+            total += len(remainder)
+            while True:
+                chunk = await be_reader.read(65536)
+                if not chunk:
+                    break
+                await tls.write(chunk)
+                total += len(chunk)
+            keep_alive = False
+
+        return total, keep_alive
+
+
+async def _http_proxy_loop(
+    tls: "TLSTerminator",
+    be_reader: asyncio.StreamReader,
+    be_writer: asyncio.StreamWriter,
+    path_prefix: str,
+    backend: "Backend",
+    leftover: bytes,
+) -> tuple[int, int]:
+    """
+    Full HTTP/1.1 request-response loop with path and response rewriting.
+    Used when backend.rewrite_paths is True.
+    """
+    up = down = 0
+
+    # Forward the already-read leftover request body bytes
+    if leftover:
+        be_writer.write(leftover)
+        await be_writer.drain()
+        up += len(leftover)
+
+    while True:
+        # Read and rewrite one response
+        resp_bytes, keep_alive = await _proxy_response(be_reader, tls, path_prefix)
+        down += resp_bytes
+
+        if not keep_alive:
+            break
+
+        # Read next request from client
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = await tls.read(4096, timeout=30)
+            if not chunk:
+                return up, down
+            buf += chunk
+
+        sep = buf.index(b"\r\n\r\n")
+        req_headers = buf[: sep + 4]
+        req_leftover = buf[sep + 4:]
+
+        # Parse request body length
+        req_content_length = 0
+        req_chunked = False
+        for line in req_headers.decode("utf-8", errors="replace").split("\r\n")[1:]:
+            lower = line.lower()
+            if lower.startswith("content-length:"):
+                try:
+                    req_content_length = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif lower.startswith("transfer-encoding:") and "chunked" in lower:
+                req_chunked = True
+
+        # Rewrite and forward request
+        new_req = rewrite_http_request(req_headers, path_prefix, backend.strip_path, backend.host, backend.port)
+        be_writer.write(new_req)
+        up += len(new_req)
+
+        # Forward request body
+        if req_content_length > 0:
+            body = req_leftover
+            remaining = req_content_length - len(req_leftover)
+            while remaining > 0:
+                chunk = await tls.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                body += chunk
+                remaining -= len(chunk)
+            be_writer.write(body)
+            up += len(body)
+        elif req_chunked:
+            buf = req_leftover
+            while not (b"\r\n0\r\n\r\n" in buf or buf.endswith(b"0\r\n\r\n")):
+                be_writer.write(buf)
+                up += len(buf)
+                buf = await tls.read(65536)
+                if not buf:
+                    break
+            be_writer.write(buf)
+            up += len(buf)
+
+        await be_writer.drain()
+
+    return up, down
+
+
 # ── Terminated connection handler ─────────────────────────────────────────────
 
 async def handle_terminated(
@@ -462,43 +758,54 @@ async def handle_terminated(
             return
 
         be_writer.write(new_headers)
-        if leftover:
-            be_writer.write(leftover)
         await be_writer.drain()
+        up += len(new_headers)
 
-        # Bidirectional pipe: client (decrypted) ↔ backend
-        async def client_to_be() -> None:
-            nonlocal up
-            try:
-                while True:
-                    data = await tls.read(65536)
-                    if not data:
-                        break
-                    be_writer.write(data)
-                    await be_writer.drain()
-                    up += len(data)
-            except Exception:
-                pass
-            finally:
+        if backend.rewrite_paths and path_prefix:
+            # HTTP/1.1 loop with response rewriting
+            add_up, add_down = await _http_proxy_loop(
+                tls, be_reader, be_writer, path_prefix, backend, leftover
+            )
+            up += add_up
+            down += add_down
+        else:
+            # Simple bidirectional pipe
+            if leftover:
+                be_writer.write(leftover)
+                await be_writer.drain()
+
+            async def client_to_be() -> None:
+                nonlocal up
                 try:
-                    be_writer.close()
-                    await be_writer.wait_closed()
+                    while True:
+                        data = await tls.read(65536)
+                        if not data:
+                            break
+                        be_writer.write(data)
+                        await be_writer.drain()
+                        up += len(data)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        be_writer.close()
+                        await be_writer.wait_closed()
+                    except Exception:
+                        pass
+
+            async def be_to_client() -> None:
+                nonlocal down
+                try:
+                    while True:
+                        data = await be_reader.read(65536)
+                        if not data:
+                            break
+                        await tls.write(data)
+                        down += len(data)
                 except Exception:
                     pass
 
-        async def be_to_client() -> None:
-            nonlocal down
-            try:
-                while True:
-                    data = await be_reader.read(65536)
-                    if not data:
-                        break
-                    await tls.write(data)
-                    down += len(data)
-            except Exception:
-                pass
-
-        await asyncio.gather(client_to_be(), be_to_client())
+            await asyncio.gather(client_to_be(), be_to_client())
 
         elapsed = time.monotonic() - started
         logger.info(
