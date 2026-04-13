@@ -39,6 +39,6 @@
   "read_timeout": 5,
   "admin_host": "0.0.0.0",
   "admin_port": 8888,
-  "tls_cert": "/home/admin/ClouDNS/MarcBudie.crt",
-  "tls_key": "/home/admin/ClouDNS/MarcBudie.key"
+  "tls_cert": "/home/admin/ssl/ClouDNS/MarcBudie.crt",
+  "tls_key": "/home/admin/ssl/ClouDNS/MarcBudie.key"
 }
