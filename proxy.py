@@ -362,8 +362,11 @@ def rewrite_http_request(
     strip_path: bool,
     backend_host: str,
     backend_port: int,
+    strip_encoding: bool = False,
 ) -> bytes:
-    """Rewrite request line (strip path prefix) and Host header."""
+    """Rewrite request line (strip path prefix) and Host header.
+    If strip_encoding=True, removes Accept-Encoding so the backend
+    returns uncompressed content (required for HTML body rewriting)."""
     try:
         text = headers_bytes.decode("utf-8", errors="replace")
         lines = text.split("\r\n")
@@ -379,8 +382,11 @@ def rewrite_http_request(
             lines[0] = f"{method} {path} {version}"
         new_lines = []
         for line in lines:
-            if line.lower().startswith("host:"):
+            lower = line.lower()
+            if lower.startswith("host:"):
                 new_lines.append(f"Host: {backend_host}:{backend_port}")
+            elif strip_encoding and lower.startswith("accept-encoding:"):
+                pass  # drop — force uncompressed response
             else:
                 new_lines.append(line)
         return "\r\n".join(new_lines).encode("utf-8")
@@ -649,7 +655,7 @@ async def _http_proxy_loop(
                 req_chunked = True
 
         # Rewrite and forward request
-        new_req = rewrite_http_request(req_headers, path_prefix, backend.strip_path, backend.host, backend.port)
+        new_req = rewrite_http_request(req_headers, path_prefix, backend.strip_path, backend.host, backend.port, strip_encoding=True)
         be_writer.write(new_req)
         up += len(new_req)
 
@@ -730,7 +736,8 @@ async def handle_terminated(
         logger.info(f"[{src}] SNI={sni} {method} {full_path:<30} → {backend.name} ({backend.host}:{backend.port})")
 
         new_headers = rewrite_http_request(
-            headers_data, path_prefix, backend.strip_path, backend.host, backend.port
+            headers_data, path_prefix, backend.strip_path, backend.host, backend.port,
+            strip_encoding=backend.rewrite_paths,
         )
 
         # Connect to backend
