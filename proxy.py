@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import signal
+import ssl
 import struct
 import sys
 import time
@@ -67,6 +68,8 @@ class Config:
     read_timeout: int
     admin_host: str = "0.0.0.0"
     admin_port: int = 8888
+    tls_cert: Optional[str] = None   # voor foutpagina's via TLS
+    tls_key: Optional[str] = None
 
 
 def _parse_backend(d: dict) -> Backend:
@@ -99,6 +102,8 @@ def load_config(path: Path) -> Config:
         read_timeout=raw.get("read_timeout", 5),
         admin_host=raw.get("admin_host", "0.0.0.0"),
         admin_port=raw.get("admin_port", 8888),
+        tls_cert=raw.get("tls_cert"),
+        tls_key=raw.get("tls_key"),
     )
 
 
@@ -114,6 +119,8 @@ def save_config(cfg: Config, path: Path) -> None:
         "read_timeout": cfg.read_timeout,
         "admin_host": cfg.admin_host,
         "admin_port": cfg.admin_port,
+        "tls_cert": cfg.tls_cert,
+        "tls_key": cfg.tls_key,
     }
     path.write_text(json.dumps(data, indent=2))
 
@@ -204,12 +211,93 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label
     return total
 
 
+# ── TLS error page ───────────────────────────────────────────────────────────
+
+ERROR_HTML = """\
+<!DOCTYPE html>
+<html lang="nl">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Route uitgeschakeld</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background: #f0f2f5; display: flex;
+         align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+  .card {{ background: #fff; border-radius: 12px; padding: 2.5rem 3rem; text-align: center;
+           box-shadow: 0 2px 12px rgba(0,0,0,.1); max-width: 420px; }}
+  h1 {{ font-size: 1.3rem; color: #b91c1c; margin-bottom: .75rem; }}
+  p  {{ color: #555; font-size: .95rem; line-height: 1.5; }}
+  code {{ background: #f3f4f6; padding: .15rem .4rem; border-radius: 4px; font-size: .9rem; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Route uitgeschakeld</h1>
+  <p><code>{hostname}</code> is momenteel uitgeschakeld.<br>
+  Schakel de route in via de <a href="http://{admin_host}">admin UI</a>.</p>
+</div>
+</body>
+</html>
+"""
+
+
+async def send_tls_error_page(
+    initial_data: bytes,
+    sni: str,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    ssl_ctx: ssl.SSLContext,
+    admin_host: str,
+) -> None:
+    """Terminate TLS and send an HTML error page, then close."""
+    incoming = ssl.MemoryBIO()
+    outgoing = ssl.MemoryBIO()
+    ssl_obj = ssl_ctx.wrap_bio(incoming, outgoing, server_side=True)
+    incoming.write(initial_data)
+
+    async def flush() -> None:
+        if outgoing.pending:
+            writer.write(outgoing.read())
+            await writer.drain()
+
+    # Handshake
+    try:
+        while True:
+            try:
+                ssl_obj.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                await flush()
+                more = await asyncio.wait_for(reader.read(16384), timeout=10)
+                if not more:
+                    return
+                incoming.write(more)
+            except ssl.SSLWantWriteError:
+                await flush()
+        await flush()
+    except Exception:
+        return
+
+    # Send HTTP response
+    body = ERROR_HTML.format(hostname=sni, admin_host=admin_host).encode("utf-8")
+    response = (
+        f"HTTP/1.1 503 Service Unavailable\r\n"
+        f"Content-Type: text/html; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode() + body
+    try:
+        ssl_obj.write(response)
+        await flush()
+    except Exception:
+        pass
+
+
 # ── Connection handler ────────────────────────────────────────────────────────
 
 async def handle_connection(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     cfg: Config,
+    ssl_ctx: Optional[ssl.SSLContext],
 ) -> None:
     peer = client_writer.get_extra_info("peername") or ("?", 0)
     src = f"{peer[0]}:{peer[1]}"
@@ -237,7 +325,12 @@ async def handle_connection(
             return
 
         if not backend.enabled:
-            logger.warning(f"[{src}] SNI={sni} — route disabled, dropped")
+            logger.info(f"[{src}] SNI={sni} — route disabled, sending error page")
+            if ssl_ctx:
+                await send_tls_error_page(
+                    initial, sni, client_reader, client_writer, ssl_ctx,
+                    f"{cfg.admin_host}:{cfg.admin_port}",
+                )
             return
 
         logger.info(f"[{src}] SNI={sni:<35} → {backend.name} ({backend.host}:{backend.port})")
@@ -577,11 +670,24 @@ class ProxyServer:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
         self.cfg = load_config(config_path)
+        self._ssl_ctx = self._load_ssl_ctx()
+
+    def _load_ssl_ctx(self) -> Optional[ssl.SSLContext]:
+        if self.cfg.tls_cert and self.cfg.tls_key:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(self.cfg.tls_cert, self.cfg.tls_key)
+                logger.info(f"TLS cert geladen: {self.cfg.tls_cert}")
+                return ctx
+            except Exception as exc:
+                logger.error(f"Kon TLS cert niet laden: {exc}")
+        return None
 
     def reload(self) -> None:
         logger.info("SIGHUP received — reloading config")
         try:
             self.cfg = load_config(self.config_path)
+            self._ssl_ctx = self._load_ssl_ctx()
             log_config(self.cfg)
         except Exception as exc:
             logger.error(f"Config reload failed: {exc} — keeping old config")
@@ -590,7 +696,7 @@ class ProxyServer:
         log_config(self.cfg)
 
         def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> asyncio.Task:
-            return asyncio.create_task(handle_connection(r, w, self.cfg))
+            return asyncio.create_task(handle_connection(r, w, self.cfg, self._ssl_ctx))
 
         def admin_handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> asyncio.Task:
             return asyncio.create_task(handle_admin(r, w, self))
