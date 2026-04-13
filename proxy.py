@@ -506,7 +506,7 @@ async def _proxy_response(
 
     # No body for 1xx, 204, 304
     if status_code in (204, 304) or (100 <= status_code < 200):
-        await tls.write("\r\n".join(new_lines).encode("utf-8"))
+        await tls.write(("\r\n".join(new_lines) + "\r\n\r\n").encode("utf-8"))
         return 0, False
 
     if is_html:
@@ -552,13 +552,13 @@ async def _proxy_response(
         if not has_cl:
             final_lines.insert(1, f"Content-Length: {len(body)}")
 
-        await tls.write("\r\n".join(final_lines).encode("utf-8"))
+        await tls.write(("\r\n".join(final_lines) + "\r\n\r\n").encode("utf-8"))
         await tls.write(body)
         return len(body), keep_alive
 
     else:
         # Non-HTML: stream body, headers already rewritten
-        await tls.write("\r\n".join(new_lines).encode("utf-8"))
+        await tls.write(("\r\n".join(new_lines) + "\r\n\r\n").encode("utf-8"))
         total = 0
 
         if content_length >= 0:
