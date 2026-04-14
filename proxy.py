@@ -540,6 +540,37 @@ def _fmt_bytes(n: int) -> str:
 
 # ── Admin HTML pages ──────────────────────────────────────────────────────────
 
+LOGO_SVG = """\
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">
+  <rect width="40" height="40" rx="9" fill="#4f46e5"/>
+  <circle cx="8" cy="20" r="3.5" fill="white"/>
+  <circle cx="20" cy="20" r="4.5" fill="white"/>
+  <circle cx="33" cy="10" r="3" fill="white" opacity=".9"/>
+  <circle cx="33" cy="20" r="3" fill="white" opacity=".9"/>
+  <circle cx="33" cy="30" r="3" fill="white" opacity=".9"/>
+  <line x1="11.5" y1="20" x2="15.5" y2="20" stroke="white" stroke-width="2" stroke-linecap="round"/>
+  <line x1="24.5" y1="20" x2="30" y2="20" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="23.5" y1="17" x2="30" y2="11" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="23.5" y1="23" x2="30" y2="29" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+</svg>"""
+
+_LOGO_INLINE = """\
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" width="{size}" height="{size}" style="flex-shrink:0">
+  <rect width="40" height="40" rx="9" fill="#4f46e5"/>
+  <circle cx="8" cy="20" r="3.5" fill="white"/>
+  <circle cx="20" cy="20" r="4.5" fill="white"/>
+  <circle cx="33" cy="10" r="3" fill="white" opacity=".9"/>
+  <circle cx="33" cy="20" r="3" fill="white" opacity=".9"/>
+  <circle cx="33" cy="30" r="3" fill="white" opacity=".9"/>
+  <line x1="11.5" y1="20" x2="15.5" y2="20" stroke="white" stroke-width="2" stroke-linecap="round"/>
+  <line x1="24.5" y1="20" x2="30" y2="20" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="23.5" y1="17" x2="30" y2="11" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="23.5" y1="23" x2="30" y2="29" stroke="white" stroke-width="1.8" stroke-linecap="round"/>
+</svg>"""
+
+_LOGO_36 = _LOGO_INLINE.format(size=36)
+_LOGO_32 = _LOGO_INLINE.format(size=32)
+
 LOGIN_HTML = """\
 <!DOCTYPE html>
 <html lang="nl">
@@ -547,6 +578,7 @@ LOGIN_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SNI Proxy — Inloggen</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #f0f2f5;
@@ -576,7 +608,10 @@ LOGIN_HTML = """\
 </head>
 <body>
 <div class="card">
-  <h1>SNI Proxy</h1>
+  <div style="display:flex;align-items:center;justify-content:center;gap:.6rem;margin-bottom:.4rem">
+    """ + _LOGO_36 + """
+    <h1>SNI Proxy</h1>
+  </div>
   <p class="sub">Admin toegang vereist</p>
 
   <!-- Stap 1: vraag code aan -->
@@ -675,6 +710,7 @@ ADMIN_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SNI Proxy — Routes</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #f0f2f5; padding: 2rem; color: #222; }
@@ -725,7 +761,10 @@ ADMIN_HTML = """\
 </head>
 <body>
 <div class="topbar">
-  <h1>SNI Proxy &mdash; Routes</h1>
+  <div style="display:flex;align-items:center;gap:.6rem">
+    """ + _LOGO_32 + """
+    <h1>SNI Proxy</h1>
+  </div>
   <button class="btn-logout" onclick="logout()">Uitloggen</button>
 </div>
 <table>
@@ -948,7 +987,10 @@ async def handle_admin(
 
         # ── Auth endpoints (geen sessie vereist) ──────────────────────────────
 
-        if method == "GET" and path == "/login":
+        if method == "GET" and path == "/favicon.svg":
+            respond(200, "image/svg+xml", LOGO_SVG.encode())
+
+        elif method == "GET" and path == "/login":
             respond(200, "text/html; charset=utf-8", LOGIN_HTML.encode("utf-8"))
 
         elif method == "POST" and path == "/api/auth/request-code":
