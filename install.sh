@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# install.sh — bouw de container en installeer/herstart de systemd service
+# install.sh — maak venv aan, installeer systemd service en (her)start
 # Gebruik: sudo bash install.sh
-# Opnieuw uitvoeren na elke nieuwe versie van proxy.py
 
 set -euo pipefail
 
@@ -14,10 +13,18 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="py-proxy"
 SYSTEMD_DIR="/etc/systemd/system"
+VENV_DIR="$SCRIPT_DIR/venv"
+OWNER="admin"
 
-echo "=== [1/4] Container image bouwen ==="
-cd "$SCRIPT_DIR"
-podman build -t localhost/py-proxy:latest -f Containerfile .
+echo "=== [1/4] Venv aanmaken en dependencies installeren ==="
+python3 -m venv "$VENV_DIR"
+"$VENV_DIR/bin/pip" install --quiet --upgrade pip
+if [[ -f "$SCRIPT_DIR/requirements.txt" ]]; then
+    "$VENV_DIR/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"
+fi
+chown -R "$OWNER:$OWNER" "$VENV_DIR"
+chmod +x "$SCRIPT_DIR/run.sh"
+echo "Venv klaar: $VENV_DIR"
 
 echo ""
 echo "=== [2/4] Systemd service installeren ==="
@@ -41,7 +48,7 @@ echo "Handige commando's:"
 echo "  systemctl status  ${SERVICE_NAME}   # status bekijken"
 echo "  journalctl -u ${SERVICE_NAME} -f     # logs volgen"
 echo "  systemctl reload  ${SERVICE_NAME}   # config herladen (SIGHUP)"
-echo "  systemctl restart ${SERVICE_NAME}   # herstarten"
+echo "  systemctl restart ${SERVICE_NAME}   # herstarten na nieuwe proxy.py"
 echo "  systemctl stop    ${SERVICE_NAME}   # stoppen"
 echo ""
 echo "Admin UI: https://<host>:9443/"

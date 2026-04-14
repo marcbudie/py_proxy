@@ -1,26 +1,19 @@
 [Unit]
-Description=SNI Proxy (podman container)
+Description=SNI Proxy
 After=network-online.target
 Wants=network-online.target
-RequiresMountsFor=/home/admin/py_proxy /home/admin/ssl
 
 [Service]
 Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/py_proxy
+
+ExecStart=/home/admin/py_proxy/venv/bin/python3 /home/admin/py_proxy/proxy.py /home/admin/py_proxy/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+
 Restart=always
 RestartSec=5
-
-ExecStartPre=-/usr/bin/podman rm -f py-proxy
-
-ExecStart=/usr/bin/podman run \
-    --name py-proxy \
-    --rm \
-    --network=host \
-    -v /home/admin/py_proxy/config.json:/app/config.json:Z \
-    -v /home/admin/ssl:/home/admin/ssl:Z,ro \
-    localhost/py-proxy:latest
-
-ExecStop=/usr/bin/podman stop py-proxy
-ExecReload=/usr/bin/podman kill --signal HUP py-proxy
 
 StandardOutput=journal
 StandardError=journal

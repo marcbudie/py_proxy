@@ -6,17 +6,18 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 
 - `proxy.py` — de volledige proxy, één bestand, geen externe dependencies
 - `config.json` — runtime configuratie (wordt live bijgehouden door de admin UI, **niet in git** vanwege Gmail app-wachtwoord)
-- `Containerfile` — Podman/Docker container definitie
+- `requirements.txt` — leeg (alles stdlib); aanwezig voor consistentie
+- `run.sh` — start de proxy direct vanuit de venv (voor handmatig testen)
 - `proxy.service` — systemd service unit
-- `install.sh` — bouwt container en installeert/herstart de systemd service
+- `install.sh` — maakt venv aan en installeert/herstart de systemd service
 - `backup.sh` — sync naar Google Drive via rclone (`google:backup/py_proxy`)
 
 ## Installeren en starten
 
-### Via systemd + Podman (aanbevolen)
+### Via systemd + venv (aanbevolen)
 
 ```bash
-sudo bash install.sh   # bouwt container, installeert en start systemd service
+sudo bash install.sh   # maakt venv aan, installeert en start systemd service
 ```
 
 De service heet `py-proxy`. Handige commando's:
@@ -28,12 +29,14 @@ systemctl reload  py-proxy        # config herladen (SIGHUP)
 systemctl restart py-proxy        # herstarten na nieuwe versie
 ```
 
-Voer `sudo bash install.sh` opnieuw uit na elke wijziging van `proxy.py`.
+Na een wijziging van `proxy.py` is alleen `systemctl restart py-proxy` nodig.  
+`sudo bash install.sh` opnieuw uitvoeren is alleen nodig bij een nieuwe checkout of als `requirements.txt` verandert.
 
 ### Direct (ontwikkeling)
 
 ```bash
-python3 proxy.py            # gebruikt config.json in de huidige map
+bash run.sh                        # via venv
+python3 proxy.py                   # of direct, gebruikt config.json in huidige map
 python3 proxy.py pad/naar/config.json
 ```
 
@@ -145,7 +148,6 @@ E-mail wordt verstuurd via Gmail SMTP met een app-wachtwoord (`gmail_user` + `gm
 
 - Admin poort is 9443 — HTTPS verplicht, proxy weigert te starten zonder geldig `tls_cert`/`tls_key`.
 - `config.json` staat niet in git vanwege het Gmail app-wachtwoord — na een verse checkout handmatig aanmaken.
-- In de Podman container moet `config.json` **beschrijfbaar** gemount zijn (geen `:ro`), anders mislukt `save_config()` bij elke toggle/toevoeging en valt de verbinding weg.
 - De admin UI gebruikt `Connection: keep-alive` met een `while True` loop zodat de TLS-verbinding open blijft na een response. Zonder keep-alive stuurt asyncio's SSL-transport een TCP RST als de browser's `close_notify` nog in de buffer zit.
 - `onchange`-attribuut in de admin UI gebruikt enkele aanhalingstekens — `JSON.stringify` geeft dubbele aanhalingstekens terug die het HTML-attribuut anders zouden breken.
 - Pad-gebaseerde routing (hostname + pad) is geprobeerd maar werkt niet betrouwbaar voor applicaties zoals pfSense die URLs dynamisch opbouwen in JavaScript. Gebruik altijd een eigen subdomein per applicatie.

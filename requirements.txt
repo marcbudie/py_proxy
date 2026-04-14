@@ -1,0 +1,2 @@
+# py_proxy heeft geen externe Python-dependencies.
+# Alle imports zijn stdlib. Dit bestand is aanwezig voor consistentie.
