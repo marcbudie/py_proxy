@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TCP SNI Proxy — routes HTTPS by SNI hostname without TLS termination.
-Connections without a valid SNI are dropped immediately.
+Admin UI served over HTTPS (port 9443) with one-time-code authentication.
 
 Usage:
   python3 proxy.py [config.json]
@@ -12,15 +12,21 @@ Signals:
 """
 
 import asyncio
+import html
 import json
 import logging
+import secrets
 import signal
+import smtplib
 import ssl
 import struct
 import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +41,20 @@ logging.basicConfig(
 logger = logging.getLogger("proxy")
 
 
+# ── Auth constants ────────────────────────────────────────────────────────────
+
+OTP_TTL        = 300    # OTP geldig voor 5 minuten
+SESSION_TTL    = 28800  # sessie geldig voor 8 uur
+CODE_COOLDOWN  = 60     # minimaal 60s tussen code-aanvragen
+MAX_OTP_ATTEMPTS = 10   # max foutieve pogingen voor code ongeldig wordt
+
+# In-memory auth state (asyncio single-threaded — geen locks nodig)
+_otp_store: dict[str, tuple[float, bool]] = {}   # code → (expires_at, used)
+_sessions:  dict[str, float]              = {}   # token → expires_at
+_last_code_ts: float                      = 0.0  # tijdstip laatste code-aanvraag
+_verify_attempts: int                     = 0    # foutieve verify-pogingen sinds laatste code
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG: dict = {
@@ -47,8 +67,20 @@ DEFAULT_CONFIG: dict = {
     "connect_timeout": 10,
     "read_timeout": 5,
     "admin_host": "0.0.0.0",
-    "admin_port": 8888,
+    "admin_port": 9443,
+    "email": {
+        "gmail_user": "",
+        "gmail_app_password": "",
+        "to": "marc.budie@gmail.com",
+    },
 }
+
+
+@dataclass
+class EmailConfig:
+    gmail_user: str = ""
+    gmail_app_password: str = ""
+    to: str = "marc.budie@gmail.com"
 
 
 @dataclass
@@ -57,8 +89,8 @@ class Backend:
     port: int
     name: str
     enabled: bool = True
-    tls_cert: Optional[str] = None   # per-route cert voor foutpagina's
-    tls_key: Optional[str] = None
+    tls_cert: Optional[str] = None
+    tls_key:  Optional[str] = None
 
 
 @dataclass
@@ -69,9 +101,14 @@ class Config:
     connect_timeout: int
     read_timeout: int
     admin_host: str = "0.0.0.0"
-    admin_port: int = 8888
-    tls_cert: Optional[str] = None   # voor foutpagina's via TLS
-    tls_key: Optional[str] = None
+    admin_port: int = 9443
+    tls_cert: Optional[str] = None   # wildcard cert voor foutpagina's
+    tls_key:  Optional[str] = None
+    email: EmailConfig = None
+
+    def __post_init__(self):
+        if self.email is None:
+            self.email = EmailConfig()
 
 
 def _parse_backend(d: dict) -> Backend:
@@ -98,6 +135,13 @@ def load_config(path: Path) -> Config:
     if isinstance(raw_ports, int):
         raw_ports = [raw_ports]
 
+    ec = raw.get("email", {})
+    email_cfg = EmailConfig(
+        gmail_user=ec.get("gmail_user", ""),
+        gmail_app_password=ec.get("gmail_app_password", ""),
+        to=ec.get("to", "marc.budie@gmail.com"),
+    )
+
     return Config(
         listen_host=raw.get("listen_host", "0.0.0.0"),
         listen_ports=raw_ports,
@@ -105,9 +149,10 @@ def load_config(path: Path) -> Config:
         connect_timeout=raw.get("connect_timeout", 10),
         read_timeout=raw.get("read_timeout", 5),
         admin_host=raw.get("admin_host", "0.0.0.0"),
-        admin_port=raw.get("admin_port", 8888),
+        admin_port=raw.get("admin_port", 9443),
         tls_cert=raw.get("tls_cert"),
         tls_key=raw.get("tls_key"),
+        email=email_cfg,
     )
 
 
@@ -128,6 +173,11 @@ def save_config(cfg: Config, path: Path) -> None:
         "admin_port": cfg.admin_port,
         "tls_cert": cfg.tls_cert,
         "tls_key": cfg.tls_key,
+        "email": {
+            "gmail_user": cfg.email.gmail_user,
+            "gmail_app_password": cfg.email.gmail_app_password,
+            "to": cfg.email.to,
+        },
     }
     path.write_text(json.dumps(data, indent=2))
 
@@ -218,7 +268,7 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label
     return total
 
 
-# ── TLS error page ───────────────────────────────────────────────────────────
+# ── TLS error page ────────────────────────────────────────────────────────────
 
 ERROR_HTML = """\
 <!DOCTYPE html>
@@ -246,7 +296,6 @@ ERROR_HTML = """\
 """
 
 
-
 async def send_tls_error_page(
     initial_data: bytes,
     sni: str,
@@ -266,7 +315,6 @@ async def send_tls_error_page(
             writer.write(outgoing.read())
             await writer.drain()
 
-    # Handshake
     try:
         while True:
             try:
@@ -284,8 +332,7 @@ async def send_tls_error_page(
     except Exception:
         return
 
-    # Send HTTP response
-    body = ERROR_HTML.format(hostname=sni, admin_host=admin_host).encode("utf-8")
+    body = ERROR_HTML.format(hostname=html.escape(sni), admin_host=html.escape(admin_host)).encode("utf-8")
     response = (
         f"HTTP/1.1 503 Service Unavailable\r\n"
         f"Content-Type: text/html; charset=utf-8\r\n"
@@ -297,6 +344,107 @@ async def send_tls_error_page(
         await flush()
     except Exception:
         pass
+
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+
+def _cleanup_expired() -> None:
+    now = time.time()
+    expired_otps = [c for c, (exp, _) in _otp_store.items() if now > exp]
+    for c in expired_otps:
+        del _otp_store[c]
+    expired_sessions = [t for t, exp in _sessions.items() if now > exp]
+    for t in expired_sessions:
+        del _sessions[t]
+
+
+def _check_session(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    exp = _sessions.get(token)
+    if exp is None or time.time() > exp:
+        if token in _sessions:
+            del _sessions[token]
+        return False
+    return True
+
+
+def _create_session() -> str:
+    token = secrets.token_hex(32)
+    _sessions[token] = time.time() + SESSION_TTL
+    return token
+
+
+def _generate_otp() -> str:
+    """Maak een 6-cijferige code en sla hem op."""
+    global _verify_attempts
+    _cleanup_expired()
+    _verify_attempts = 0
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    _otp_store[code] = (time.time() + OTP_TTL, False)
+    return code
+
+
+def _verify_otp(code: str) -> bool:
+    """Geeft True als de code klopt, geldig is en nog niet gebruikt is.
+    Na MAX_OTP_ATTEMPTS foutieve pogingen wordt de code ongeldig gemaakt."""
+    global _verify_attempts
+    entry = _otp_store.get(code)
+    if entry is None:
+        _verify_attempts += 1
+        if _verify_attempts >= MAX_OTP_ATTEMPTS:
+            _otp_store.clear()
+            logger.warning("Max OTP-pogingen bereikt — code ongeldig gemaakt")
+        return False
+    expires_at, used = entry
+    if used or time.time() > expires_at:
+        del _otp_store[code]
+        return False
+    _otp_store[code] = (expires_at, True)  # markeer als gebruikt
+    _verify_attempts = 0
+    return True
+
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+
+def _send_otp_email_sync(code: str, email_cfg: EmailConfig) -> None:
+    """Verstuurt de OTP-code via Gmail (blocking — in executor aanroepen)."""
+    now_str = datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M UTC")
+    html = f"""\
+<html>
+<body style="font-family:system-ui,sans-serif;color:#1a1a1a;background:#f0f2f5;
+             display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+  <div style="background:#fff;border-radius:12px;padding:2.5rem 3rem;text-align:center;
+              box-shadow:0 2px 12px rgba(0,0,0,.1);max-width:400px">
+    <h2 style="color:#6366f1;margin-bottom:1rem">SNI Proxy — Inlogcode</h2>
+    <p style="color:#555;font-size:.95rem;margin-bottom:1.5rem">
+      Gebruik de onderstaande code om in te loggen op de proxy admin UI.<br>
+      De code is <strong>5 minuten geldig</strong> en kan maar <strong>één keer</strong> worden gebruikt.
+    </p>
+    <div style="font-size:2.5rem;font-weight:700;letter-spacing:.3em;color:#111;
+                background:#f3f4f6;border-radius:8px;padding:.75rem 1.5rem;display:inline-block">
+      {code}
+    </div>
+    <p style="color:#aaa;font-size:.78rem;margin-top:1.5rem">{now_str}</p>
+  </div>
+</body>
+</html>"""
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "SNI Proxy — Inlogcode"
+    msg["From"]    = email_cfg.gmail_user
+    msg["To"]      = email_cfg.to
+    msg.attach(MIMEText(html, "html"))
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
+        server.login(email_cfg.gmail_user, email_cfg.gmail_app_password)
+        server.sendmail(email_cfg.gmail_user, email_cfg.to, msg.as_string())
+
+
+async def send_otp_email(code: str, email_cfg: EmailConfig) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _send_otp_email_sync, code, email_cfg)
 
 
 # ── Connection handler ────────────────────────────────────────────────────────
@@ -390,7 +538,135 @@ def _fmt_bytes(n: int) -> str:
     return f"{n}TB"
 
 
-# ── Admin web UI ──────────────────────────────────────────────────────────────
+# ── Admin HTML pages ──────────────────────────────────────────────────────────
+
+LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNI Proxy — Inloggen</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f0f2f5;
+         display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; color: #222; }
+  .card { background: #fff; border-radius: 12px; padding: 2.5rem 3rem;
+          box-shadow: 0 2px 12px rgba(0,0,0,.12); width: 360px; text-align: center; }
+  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: .4rem; }
+  .sub { color: #888; font-size: .88rem; margin-bottom: 2rem; }
+  .step { display: none; }
+  .step.active { display: block; }
+  button { width: 100%; padding: .65rem; border: none; border-radius: 8px;
+           background: #6366f1; color: #fff; font-size: .95rem; cursor: pointer;
+           font-weight: 500; transition: background .15s; }
+  button:hover { background: #4f46e5; }
+  button:disabled { background: #a5b4fc; cursor: wait; }
+  input[type=text] { width: 100%; padding: .6rem .8rem; border: 1px solid #d1d5db;
+                     border-radius: 8px; font-size: 1.1rem; text-align: center;
+                     letter-spacing: .25em; margin-bottom: 1rem; }
+  input[type=text]:focus { outline: 2px solid #6366f1; border-color: transparent; }
+  .msg { margin-top: 1rem; padding: .6rem .9rem; border-radius: 8px;
+         font-size: .85rem; display: none; }
+  .msg-ok  { background: #dcf5e7; color: #166534; display: block; }
+  .msg-err { background: #fde8e8; color: #991b1b; display: block; }
+  .hint { color: #9ca3af; font-size: .8rem; margin-top: 1.5rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>SNI Proxy</h1>
+  <p class="sub">Admin toegang vereist</p>
+
+  <!-- Stap 1: vraag code aan -->
+  <div id="step1" class="step active">
+    <button id="btnSend" onclick="requestCode()">Stuur inlogcode naar e-mail</button>
+    <p class="hint">Er wordt een eenmalige code naar het beheerders-e-mailadres verstuurd.</p>
+    <div id="msg1" class="msg"></div>
+  </div>
+
+  <!-- Stap 2: voer code in -->
+  <div id="step2" class="step">
+    <p style="color:#555;font-size:.88rem;margin-bottom:1.25rem">
+      Er is een 6-cijferige code naar je e-mail verstuurd.<br>
+      De code is 5 minuten geldig.
+    </p>
+    <input id="codeInput" type="text" maxlength="6" placeholder="000000"
+           oninput="this.value=this.value.replace(/[^0-9]/g,'')"
+           onkeydown="if(event.key==='Enter')verifyCode()">
+    <button id="btnVerify" onclick="verifyCode()">Inloggen</button>
+    <p class="hint" style="cursor:pointer" onclick="backToStep1()">
+      &larr; Nieuwe code aanvragen
+    </p>
+    <div id="msg2" class="msg"></div>
+  </div>
+</div>
+
+<script>
+function show(id) {
+  document.getElementById('step1').classList.remove('active');
+  document.getElementById('step2').classList.remove('active');
+  document.getElementById(id).classList.add('active');
+}
+function setMsg(id, text, ok) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+}
+
+async function requestCode() {
+  const btn = document.getElementById('btnSend');
+  btn.disabled = true;
+  btn.textContent = 'Versturen\u2026';
+  setMsg('msg1', '', false);
+  try {
+    const r = await fetch('/api/auth/request-code', {method: 'POST'});
+    const d = await r.json();
+    if (!r.ok) { setMsg('msg1', d.error || 'Fout bij versturen.', false); return; }
+    show('step2');
+    document.getElementById('codeInput').focus();
+  } catch (e) {
+    setMsg('msg1', 'Netwerkfout: ' + e, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Stuur inlogcode naar e-mail';
+  }
+}
+
+async function verifyCode() {
+  const code = document.getElementById('codeInput').value.trim();
+  if (code.length !== 6) { setMsg('msg2', 'Voer een 6-cijferige code in.', false); return; }
+  const btn = document.getElementById('btnVerify');
+  btn.disabled = true;
+  btn.textContent = 'Controleren\u2026';
+  try {
+    const r = await fetch('/api/auth/verify', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code}),
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('msg2', d.error || 'Ongeldige code.', false); return; }
+    window.location.href = '/';
+  } catch (e) {
+    setMsg('msg2', 'Netwerkfout: ' + e, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Inloggen';
+  }
+}
+
+function backToStep1() {
+  document.getElementById('codeInput').value = '';
+  setMsg('msg2', '', false);
+  show('step1');
+}
+</script>
+</body>
+</html>
+"""
+
 
 ADMIN_HTML = """\
 <!DOCTYPE html>
@@ -402,7 +678,13 @@ ADMIN_HTML = """\
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #f0f2f5; padding: 2rem; color: #222; }
-  h1 { margin-bottom: 1.5rem; font-size: 1.4rem; font-weight: 600; }
+  .topbar { display: flex; align-items: center; justify-content: space-between;
+            max-width: 800px; margin-bottom: 1.5rem; }
+  h1 { font-size: 1.4rem; font-weight: 600; }
+  .btn-logout { background: none; border: 1px solid #d1d5db; color: #555;
+                border-radius: 6px; padding: .3rem .8rem; font-size: .82rem;
+                cursor: pointer; }
+  .btn-logout:hover { background: #f3f4f6; }
   table { width: 100%; max-width: 800px; border-collapse: collapse; background: #fff;
           border-radius: 10px; overflow: hidden; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
   th { background: #f7f7f7; padding: .7rem 1.2rem; text-align: left; font-size: .8rem;
@@ -425,7 +707,6 @@ ADMIN_HTML = """\
   .btn-del { background: none; border: 1px solid #fca5a5; color: #dc2626; border-radius: 6px;
              padding: .25rem .6rem; font-size: .8rem; cursor: pointer; }
   .btn-del:hover { background: #fef2f2; }
-  /* Add form */
   .add-card { margin-top: 1.5rem; max-width: 800px; background: #fff; border-radius: 10px;
               padding: 1.25rem 1.5rem; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
   .add-card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }
@@ -443,7 +724,10 @@ ADMIN_HTML = """\
 </style>
 </head>
 <body>
-<h1>SNI Proxy &mdash; Routes</h1>
+<div class="topbar">
+  <h1>SNI Proxy &mdash; Routes</h1>
+  <button class="btn-logout" onclick="logout()">Uitloggen</button>
+</div>
 <table>
   <thead>
     <tr>
@@ -476,6 +760,7 @@ ADMIN_HTML = """\
 async function load() {
   try {
     const r = await fetch('/api/routes');
+    if (r.status === 401) { window.location.href = '/login'; return; }
     const routes = await r.json();
     document.getElementById('tbody').innerHTML = routes.length ? routes.map(rt => `
       <tr>
@@ -501,6 +786,7 @@ async function toggle(hostname, el) {
   el.disabled = true;
   try {
     const r = await fetch('/api/routes/' + encodeURIComponent(hostname) + '/toggle', {method: 'POST'});
+    if (r.status === 401) { window.location.href = '/login'; return; }
     if (!r.ok) { el.checked = !el.checked; showMsg('Fout bij omschakelen van ' + hostname, false); return; }
     const data = await r.json();
     showMsg(`${hostname} is nu ${data.enabled ? 'ingeschakeld' : 'uitgeschakeld'}.`, true);
@@ -515,6 +801,7 @@ async function remove(hostname) {
   if (!confirm(`Route "${hostname}" verwijderen?`)) return;
   try {
     const r = await fetch('/api/routes/' + encodeURIComponent(hostname), {method: 'DELETE'});
+    if (r.status === 401) { window.location.href = '/login'; return; }
     if (!r.ok) { showMsg('Verwijderen mislukt.', false); return; }
     showMsg(`${hostname} verwijderd.`, true);
     await load();
@@ -533,6 +820,7 @@ async function addRoute() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({hostname, host, port, name}),
     });
+    if (r.status === 401) { window.location.href = '/login'; return; }
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
       showMsg(d.error || 'Toevoegen mislukt.', false);
@@ -545,6 +833,11 @@ async function addRoute() {
     document.getElementById('f-name').value = '';
     await load();
   } catch (e) { showMsg('Netwerkfout: ' + e, false); }
+}
+
+async function logout() {
+  await fetch('/api/auth/logout', {method: 'POST'});
+  window.location.href = '/login';
 }
 
 function showMsg(text, ok) {
@@ -567,45 +860,151 @@ load();
 """
 
 
+# ── Admin web UI handler ──────────────────────────────────────────────────────
+
+def _parse_cookies(cookie_header: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
 async def handle_admin(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     proxy_server: "ProxyServer",
 ) -> None:
     try:
-        request_line = await asyncio.wait_for(reader.readline(), timeout=10)
+      while True:
+        try:
+            request_line = await asyncio.wait_for(reader.readline(), timeout=30)
+        except asyncio.TimeoutError:
+            break
         if not request_line:
-            return
+            break
         parts = request_line.decode("utf-8", errors="replace").strip().split()
         if len(parts) < 2:
             return
         method, path = parts[0].upper(), parts[1].split("?")[0]
 
+        headers_raw: dict[str, str] = {}
         content_length = 0
         while True:
             line = await asyncio.wait_for(reader.readline(), timeout=10)
             if not line or line in (b"\r\n", b"\n"):
                 break
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers_raw[k.strip().lower().decode()] = v.strip().decode()
             if line.lower().startswith(b"content-length:"):
                 try:
                     content_length = int(line.split(b":")[1].strip())
                 except ValueError:
                     pass
+
         body = b""
         if content_length > 0:
             body = await asyncio.wait_for(reader.read(min(content_length, 4096)), timeout=10)
 
-        def respond(status: int, content_type: str, body: bytes) -> None:
-            status_text = {200: "OK", 400: "Bad Request", 404: "Not Found"}.get(status, "")
-            writer.write((
-                f"HTTP/1.1 {status} {status_text}\r\n"
-                f"Content-Type: {content_type}\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                f"Connection: close\r\n\r\n"
-            ).encode() + body)
+        cookies = _parse_cookies(headers_raw.get("cookie", ""))
+        session_token = cookies.get("proxy_session")
+        authed = _check_session(session_token)
 
-        if method == "GET" and path == "/":
-            respond(200, "text/html; charset=utf-8", ADMIN_HTML.encode("utf-8"))
+        STATUS_TEXTS = {
+            200: "OK", 302: "Found", 400: "Bad Request",
+            401: "Unauthorized", 404: "Not Found",
+            429: "Too Many Requests", 500: "Internal Server Error",
+        }
+
+        def respond(
+            status: int,
+            content_type: str,
+            body_bytes: bytes,
+            extra_headers: Optional[list[tuple[str, str]]] = None,
+        ) -> None:
+            lines = [
+                f"HTTP/1.1 {status} {STATUS_TEXTS.get(status, '')}",
+                f"Content-Type: {content_type}",
+                f"Content-Length: {len(body_bytes)}",
+                "Connection: keep-alive",
+            ]
+            if extra_headers:
+                lines.extend(f"{k}: {v}" for k, v in extra_headers)
+            writer.write(("\r\n".join(lines) + "\r\n\r\n").encode() + body_bytes)
+
+        def redirect(location: str) -> None:
+            writer.write((
+                f"HTTP/1.1 302 Found\r\n"
+                f"Location: {location}\r\n"
+                f"Content-Length: 0\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode())
+
+        def json_resp(status: int, data: dict, extra_headers: Optional[list[tuple[str, str]]] = None) -> None:
+            respond(status, "application/json", json.dumps(data).encode(), extra_headers)
+
+        # ── Auth endpoints (geen sessie vereist) ──────────────────────────────
+
+        if method == "GET" and path == "/login":
+            respond(200, "text/html; charset=utf-8", LOGIN_HTML.encode("utf-8"))
+
+        elif method == "POST" and path == "/api/auth/request-code":
+            global _last_code_ts
+            now = time.time()
+            remaining = CODE_COOLDOWN - (now - _last_code_ts)
+            if remaining > 0:
+                json_resp(429, {"error": f"Wacht nog {int(remaining)+1} seconden voor een nieuwe code."})
+            elif not proxy_server.cfg.email.gmail_user:
+                json_resp(500, {"error": "E-mail niet geconfigureerd in config.json."})
+            else:
+                code = _generate_otp()
+                _last_code_ts = now
+                try:
+                    await send_otp_email(code, proxy_server.cfg.email)
+                    logger.info(f"OTP-code verstuurd naar {proxy_server.cfg.email.to}")
+                    json_resp(200, {"ok": True})
+                except Exception as exc:
+                    logger.error(f"E-mail versturen mislukt: {exc}")
+                    json_resp(500, {"error": "E-mail versturen mislukt. Controleer de e-mailconfiguratie."})
+
+        elif method == "POST" and path == "/api/auth/verify":
+            try:
+                data = json.loads(body)
+                code = str(data.get("code", "")).strip()
+            except Exception:
+                json_resp(400, {"error": "Ongeldige invoer."})
+            else:
+                if _verify_otp(code):
+                    token = _create_session()
+                    cookie = (
+                        f"proxy_session={token}; "
+                        f"Max-Age={SESSION_TTL}; "
+                        f"Path=/; HttpOnly; Secure; SameSite=Strict"
+                    )
+                    logger.info("Succesvolle inlog via OTP")
+                    json_resp(200, {"ok": True}, [("Set-Cookie", cookie)])
+                else:
+                    json_resp(401, {"error": "Ongeldige of verlopen code."})
+
+        elif method == "POST" and path == "/api/auth/logout":
+            if session_token and session_token in _sessions:
+                del _sessions[session_token]
+            clear_cookie = "proxy_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"
+            json_resp(200, {"ok": True}, [("Set-Cookie", clear_cookie)])
+
+        # ── Beveiligde routes (sessie vereist) ────────────────────────────────
+
+        elif method == "GET" and path == "/":
+            if not authed:
+                redirect("/login")
+            else:
+                respond(200, "text/html; charset=utf-8", ADMIN_HTML.encode("utf-8"))
+
+        elif not authed:
+            json_resp(401, {"error": "Niet ingelogd."})
 
         elif method == "GET" and path == "/api/routes":
             routes = [
@@ -624,41 +1023,41 @@ async def handle_admin(
                 if not hostname or not host or not name or not (1 <= port <= 65535):
                     raise ValueError("invalid fields")
             except Exception:
-                respond(400, "application/json", json.dumps({"error": "ongeldige invoer"}).encode())
+                json_resp(400, {"error": "Ongeldige invoer."})
             else:
                 if hostname in proxy_server.cfg.tls_routes:
-                    respond(400, "application/json", json.dumps({"error": "hostname bestaat al"}).encode())
+                    json_resp(400, {"error": "Hostname bestaat al."})
                 else:
                     proxy_server.cfg.tls_routes[hostname] = Backend(host=host, port=port, name=name)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     logger.info(f"Route {hostname} → {name} ({host}:{port}) toegevoegd via admin UI")
-                    respond(200, "application/json", json.dumps({"hostname": hostname}).encode())
+                    json_resp(200, {"hostname": hostname})
 
         elif method == "DELETE" and path.startswith("/api/routes/"):
             hostname = urllib.parse.unquote(path[len("/api/routes/"):])
             if hostname not in proxy_server.cfg.tls_routes:
-                respond(404, "application/json", json.dumps({"error": "route not found"}).encode())
+                json_resp(404, {"error": "Route niet gevonden."})
             else:
                 del proxy_server.cfg.tls_routes[hostname]
                 save_config(proxy_server.cfg, proxy_server.config_path)
                 logger.info(f"Route {hostname} verwijderd via admin UI")
-                respond(200, "application/json", json.dumps({"hostname": hostname}).encode())
+                json_resp(200, {"hostname": hostname})
 
         elif method == "POST" and path.startswith("/api/routes/") and path.endswith("/toggle"):
             segments = path.strip("/").split("/")
             if len(segments) == 4 and segments[0] == "api" and segments[1] == "routes":
                 hostname = urllib.parse.unquote(segments[2])
-                backend = proxy_server.cfg.tls_routes.get(hostname)
+                backend  = proxy_server.cfg.tls_routes.get(hostname)
                 if backend is None:
-                    respond(404, "application/json", json.dumps({"error": "route not found"}).encode())
+                    json_resp(404, {"error": "Route niet gevonden."})
                 else:
                     backend.enabled = not backend.enabled
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"Route {hostname} {state} via admin UI")
-                    respond(200, "application/json", json.dumps({"hostname": hostname, "enabled": backend.enabled}).encode())
+                    json_resp(200, {"hostname": hostname, "enabled": backend.enabled})
             else:
-                respond(400, "application/json", json.dumps({"error": "bad request"}).encode())
+                json_resp(400, {"error": "Ongeldig verzoek."})
 
         else:
             respond(404, "text/plain", b"Not found")
@@ -703,12 +1102,29 @@ class ProxyServer:
                 logger.error(f"Kon TLS cert niet laden ({cert}): {exc}")
         return ctxs
 
-    def _ssl_ctx_for(self, backend: "Backend") -> Optional[ssl.SSLContext]:
+    def _ssl_ctx_for(self, backend: Backend) -> Optional[ssl.SSLContext]:
         if backend.tls_cert and backend.tls_key:
             return self._ssl_ctxs.get((backend.tls_cert, backend.tls_key))
         if self.cfg.tls_cert and self.cfg.tls_key:
             return self._ssl_ctxs.get((self.cfg.tls_cert, self.cfg.tls_key))
         return None
+
+    def _make_admin_ssl_ctx(self) -> Optional[ssl.SSLContext]:
+        cert = self.cfg.tls_cert
+        key  = self.cfg.tls_key
+        if not cert or not key:
+            return None
+        ctx = self._ssl_ctxs.get((cert, key))
+        if ctx:
+            return ctx
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            self._ssl_ctxs[(cert, key)] = ctx
+            return ctx
+        except Exception as exc:
+            logger.error(f"Kon admin TLS cert niet laden: {exc}")
+            return None
 
     def reload(self) -> None:
         logger.info("SIGHUP received — reloading config")
@@ -735,9 +1151,18 @@ class ProxyServer:
             addrs = [str(s.getsockname()) for s in srv.sockets or []]
             logger.info(f"Proxy listening on {', '.join(addrs)}")
 
-        admin_srv = await asyncio.start_server(admin_handler, self.cfg.admin_host, self.cfg.admin_port)
+        admin_ssl = self._make_admin_ssl_ctx()
+        if not admin_ssl:
+            logger.critical(
+                "Admin UI kan niet starten: geen geldig TLS-cert geconfigureerd. "
+                "Stel tls_cert en tls_key in in config.json."
+            )
+            raise SystemExit(1)
+        admin_srv = await asyncio.start_server(
+            admin_handler, self.cfg.admin_host, self.cfg.admin_port, ssl=admin_ssl
+        )
+        logger.info(f"Admin UI listening on https://{self.cfg.admin_host}:{self.cfg.admin_port}/ (TLS)")
         self._servers.append(admin_srv)
-        logger.info(f"Admin UI listening on http://{self.cfg.admin_host}:{self.cfg.admin_port}/")
 
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGHUP, self.reload)

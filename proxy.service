@@ -1,0 +1,21 @@
+[Unit]
+Description=SNI Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+User=admin
+WorkingDirectory=/home/admin/py_proxy
+
+ExecStart=/usr/bin/python3 /home/admin/py_proxy/proxy.py /home/admin/py_proxy/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=py-proxy
+
+[Install]
+WantedBy=multi-user.target
