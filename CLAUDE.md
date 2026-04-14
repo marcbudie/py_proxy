@@ -43,6 +43,7 @@ python3 proxy.py pad/naar/config.json
 |-------|---------|
 | 8444  | TLS SNI proxy (inkomend HTTPS-verkeer) |
 | 9443  | Admin web UI (`https://<host>:9443/`) — HTTPS met OTP-authenticatie |
+| variabel | TCP routes — willekeurige poorten gedefinieerd in `tcp_routes` |
 
 ## Config (config.json)
 
@@ -58,6 +59,9 @@ python3 proxy.py pad/naar/config.json
       "tls_key": "/pad/naar/andere.nl.key"
     }
   },
+  "tcp_routes": {
+    "2222": {"host": "192.168.1.10", "port": 22, "name": "ssh", "enabled": true}
+  },
   "connect_timeout": 10,
   "read_timeout": 5,
   "admin_host": "0.0.0.0",
@@ -72,7 +76,13 @@ python3 proxy.py pad/naar/config.json
 }
 ```
 
-Elke route stuurt verkeer voor dat hostname transparant door naar de opgegeven backend. TLS wordt niet getermineerd — het backend-certificaat blijft intact.
+Elke TLS route stuurt verkeer voor dat hostname transparant door naar de opgegeven backend. TLS wordt niet getermineerd — het backend-certificaat blijft intact.
+
+### TCP routes
+
+`tcp_routes` zijn voor plain TCP-verkeer zonder TLS (bijv. SSH, RDP). De sleutel is het poortnummer waarop de proxy luistert (als string); het verkeer wordt ongewijzigd doorgestuurd naar de backend. Er is geen SNI-inspectie — elke verbinding op die poort gaat naar de geconfigureerde backend.
+
+Uitgeschakelde TCP routes laten de verbinding direct vallen (geen foutpagina mogelijk zonder TLS).
 
 ### Foutpagina bij uitgeschakelde routes
 
@@ -96,9 +106,10 @@ Bereikbaar op `https://<host>:9443/`. Vereist inloggen via OTP-code (zie Authent
 
 Functionaliteit:
 
-- **Aan/uit toggle** per route — direct actief, opgeslagen in `config.json`
-- **Verwijderen** per route — met bevestigingsdialoog
-- **Toevoegen** via formulier onderaan — velden: hostname, backend host, poort, label
+- **Aan/uit toggle** per TLS route en per TCP route — direct actief, opgeslagen in `config.json`
+- **Verwijderen** per TLS route — met bevestigingsdialoog
+- **Toevoegen** TLS route via formulier onderaan — velden: hostname, backend host, poort, label
+- Aparte TCP routes sectie met toggle per route
 
 Wijzigingen worden direct actief en opgeslagen in `config.json` zonder herstart.
 
@@ -123,10 +134,12 @@ E-mail wordt verstuurd via Gmail SMTP met een app-wachtwoord (`gmail_user` + `gm
 | POST | `/api/auth/request-code` | Vraag OTP-code aan (verstuurt e-mail) |
 | POST | `/api/auth/verify` | Verifieer OTP-code, ontvangt sessiecookie |
 | POST | `/api/auth/logout` | Sessie beëindigen |
-| GET | `/api/routes` | Lijst van alle routes |
-| POST | `/api/routes` | Nieuwe route toevoegen (JSON body: `hostname`, `host`, `port`, `name`) |
-| POST | `/api/routes/<hostname>/toggle` | Route aan/uit schakelen |
-| DELETE | `/api/routes/<hostname>` | Route verwijderen |
+| GET | `/api/routes` | Lijst van alle TLS routes |
+| POST | `/api/routes` | Nieuwe TLS route toevoegen (JSON body: `hostname`, `host`, `port`, `name`) |
+| POST | `/api/routes/<hostname>/toggle` | TLS route aan/uit schakelen |
+| DELETE | `/api/routes/<hostname>` | TLS route verwijderen |
+| GET | `/api/tcp-routes` | Lijst van alle TCP routes |
+| POST | `/api/tcp-routes/<port>/toggle` | TCP route aan/uit schakelen |
 
 ## Bekende valkuilen
 
