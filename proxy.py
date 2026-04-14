@@ -105,10 +105,13 @@ class Config:
     tls_cert: Optional[str] = None   # wildcard cert voor foutpagina's
     tls_key:  Optional[str] = None
     email: EmailConfig = None
+    tcp_routes: dict = None           # listen_port (int) → Backend
 
     def __post_init__(self):
         if self.email is None:
             self.email = EmailConfig()
+        if self.tcp_routes is None:
+            self.tcp_routes = {}
 
 
 def _parse_backend(d: dict) -> Backend:
@@ -153,6 +156,7 @@ def load_config(path: Path) -> Config:
         tls_cert=raw.get("tls_cert"),
         tls_key=raw.get("tls_key"),
         email=email_cfg,
+        tcp_routes={int(p): _parse_backend(b) for p, b in raw.get("tcp_routes", {}).items()},
     )
 
 
@@ -178,6 +182,10 @@ def save_config(cfg: Config, path: Path) -> None:
             "gmail_app_password": cfg.email.gmail_app_password,
             "to": cfg.email.to,
         },
+        "tcp_routes": {
+            str(p): {"host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
+            for p, b in cfg.tcp_routes.items()
+        },
     }
     path.write_text(json.dumps(data, indent=2))
 
@@ -189,6 +197,11 @@ def log_config(cfg: Config) -> None:
     for host, be in cfg.tls_routes.items():
         state = "ON " if be.enabled else "OFF"
         logger.info(f"  [{state}] {host:<35} → {be.name} ({be.host}:{be.port})")
+    if cfg.tcp_routes:
+        logger.info("TCP routes:")
+        for listen_port, be in cfg.tcp_routes.items():
+            state = "ON " if be.enabled else "OFF"
+            logger.info(f"  [{state}] :{listen_port:<34} → {be.name} ({be.host}:{be.port})")
 
 
 # ── SNI extraction ────────────────────────────────────────────────────────────
@@ -930,6 +943,43 @@ def _parse_cookies(cookie_header: str) -> dict[str, str]:
     return cookies
 
 
+async def handle_tcp_connection(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    backend: Backend,
+    cfg: Config,
+) -> None:
+    src = writer.get_extra_info("peername")
+    try:
+        if not backend.enabled:
+            logger.info(f"[{src}] TCP:{backend.name} — route disabled, dropped")
+            return
+        logger.info(f"[{src}] TCP → {backend.name} ({backend.host}:{backend.port})")
+        try:
+            be_reader, be_writer = await asyncio.wait_for(
+                asyncio.open_connection(backend.host, backend.port),
+                timeout=cfg.connect_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{src}] TCP connect timeout → {backend.name}")
+            return
+        except OSError as exc:
+            logger.error(f"[{src}] TCP connect failed → {backend.name}: {exc}")
+            return
+        await asyncio.gather(
+            pipe(reader, be_writer, f"{src}→{backend.name}"),
+            pipe(be_reader, writer, f"{backend.name}→{src}"),
+        )
+    except Exception as exc:
+        logger.exception(f"[{src}] TCP unhandled: {exc}")
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
 async def handle_admin(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -1211,6 +1261,13 @@ class ProxyServer:
             self._servers.append(srv)
             addrs = [str(s.getsockname()) for s in srv.sockets or []]
             logger.info(f"Proxy listening on {', '.join(addrs)}")
+
+        for listen_port, backend in self.cfg.tcp_routes.items():
+            def tcp_handler(r, w, b=backend):
+                return asyncio.create_task(handle_tcp_connection(r, w, b, self.cfg))
+            srv = await asyncio.start_server(tcp_handler, self.cfg.listen_host, listen_port)
+            self._servers.append(srv)
+            logger.info(f"TCP route :{listen_port} → {backend.name} ({backend.host}:{backend.port})")
 
         admin_ssl = self._make_admin_ssl_ctx()
         if not admin_ssl:
