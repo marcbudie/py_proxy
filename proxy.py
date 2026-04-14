@@ -1154,21 +1154,58 @@ async function openTerminal() {
   }
 
   if (_termObj) { _termObj.dispose(); _termObj = null; }
-  document.getElementById('term-container').innerHTML = '';
+  const container = document.getElementById('term-container');
+  container.innerHTML = '';
 
   _termObj = new Terminal({cursorBlink:true, fontSize:14,
     theme:{background:'#000000', foreground:'#e2e8f0'}});
   const fit = new FitAddon.FitAddon();
   _termObj.loadAddon(fit);
-  _termObj.open(document.getElementById('term-container'));
+  _termObj.open(container);
   fit.fit();
 
   const onResize = () => fit.fit();
   window.addEventListener('resize', onResize);
 
+  // ── Mobiel toetsenbord ────────────────────────────────────────────────────
+  // Canvas-elementen triggeren geen soft-keyboard. Een verborgen textarea
+  // krijgt focus bij een touch en stuurt de input door naar de WebSocket.
+  const kb = document.createElement('textarea');
+  kb.style.cssText = 'position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;font-size:16px;z-index:1001;';
+  kb.setAttribute('autocomplete','off'); kb.setAttribute('autocorrect','off');
+  kb.setAttribute('autocapitalize','none'); kb.setAttribute('spellcheck','false');
+  overlay.appendChild(kb);
+
+  function _sendWs(data) {
+    if (_termWs && _termWs.readyState === WebSocket.OPEN)
+      _termWs.send(JSON.stringify({type:'stdin', data}));
+  }
+
+  container.addEventListener('touchstart', () => kb.focus(), {passive:true});
+
+  kb.addEventListener('input', () => {
+    let v = kb.value; kb.value = '';
+    if (v) _sendWs(v.replace(/\\n/g, '\\r'));
+  });
+
+  kb.addEventListener('keydown', e => {
+    const map = {Backspace:'\\x7f', Tab:'\\t', Escape:'\\x1b',
+                 ArrowUp:'\\x1b[A', ArrowDown:'\\x1b[B',
+                 ArrowRight:'\\x1b[C', ArrowLeft:'\\x1b[D'};
+    if (e.ctrlKey && e.key.length === 1) {
+      e.preventDefault();
+      _sendWs(String.fromCharCode(e.key.toLowerCase().charCodeAt(0) - 96));
+      return;
+    }
+    const seq = map[e.key];
+    if (seq) { e.preventDefault(); _sendWs(seq); }
+  });
+  // ─────────────────────────────────────────────────────────────────────────
+
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   _termWs = new WebSocket(proto + '//' + location.host + '/term_sock');
   _termWs._onResize = onResize;
+  _termWs._kb = kb;
   _termWs.binaryType = 'arraybuffer';
 
   _termWs.onopen = () => {
@@ -1198,6 +1235,7 @@ function closeTerminal() {
   document.getElementById('term-overlay').style.display = 'none';
   if (_termWs) {
     if (_termWs._onResize) window.removeEventListener('resize', _termWs._onResize);
+    if (_termWs._kb) _termWs._kb.remove();
     _termWs.close(); _termWs = null;
   }
   if (_termObj) { _termObj.dispose(); _termObj = null; }
