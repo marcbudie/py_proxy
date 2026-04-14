@@ -611,11 +611,21 @@ async def handle_terminal_ws(reader: asyncio.StreamReader, writer: asyncio.Strea
     try:
         master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
+
+        # Na dup2 in de child is fd 0 de slave PTY. setsid() maakt de child
+        # session leader; TIOCSCTTY stelt de slave in als controlling terminal.
+        # Zonder dit heeft bash geen job control en geen controlling terminal.
+        _TIOCSCTTY = getattr(termios, 'TIOCSCTTY', 0x540E)
+        def _setup_tty():
+            os.setsid()
+            fcntl.ioctl(0, _TIOCSCTTY, 0)
+
         proc = subprocess.Popen(
             ['/bin/bash'],
             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
             close_fds=True,
             env={**os.environ, 'TERM': 'xterm-256color'},
+            preexec_fn=_setup_tty,
         )
         os.close(slave_fd)
         slave_fd = -1
