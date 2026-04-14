@@ -15,7 +15,7 @@ ExecStart=/usr/bin/podman run \
     --name py-proxy \
     --rm \
     --network=host \
-    -v /home/admin/py_proxy/config.json:/app/config.json:Z,ro \
+    -v /home/admin/py_proxy/config.json:/app/config.json:Z \
     -v /home/admin/ssl:/home/admin/ssl:Z,ro \
     localhost/py-proxy:latest
 
