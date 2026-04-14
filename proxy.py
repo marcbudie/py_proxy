@@ -44,7 +44,7 @@ logger = logging.getLogger("proxy")
 # ── Auth constants ────────────────────────────────────────────────────────────
 
 OTP_TTL        = 300    # OTP geldig voor 5 minuten
-SESSION_TTL    = 28800  # sessie geldig voor 8 uur
+SESSION_TTL    = 1800   # sessie geldig voor 30 minuten
 CODE_COOLDOWN  = 60     # minimaal 60s tussen code-aanvragen
 MAX_OTP_ATTEMPTS = 10   # max foutieve pogingen voor code ongeldig wordt
 
