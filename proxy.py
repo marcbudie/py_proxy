@@ -604,6 +604,9 @@ LOGIN_HTML = """\
   .msg-ok  { background: #dcf5e7; color: #166534; display: block; }
   .msg-err { background: #fde8e8; color: #991b1b; display: block; }
   .hint { color: #9ca3af; font-size: .8rem; margin-top: 1.5rem; }
+  @media (max-width: 400px) {
+    .card { padding: 2rem 1.25rem; width: 100%; }
+  }
 </style>
 </head>
 <body>
@@ -757,6 +760,22 @@ ADMIN_HTML = """\
          font-size: .88rem; display: none; }
   .msg-ok  { background: #dcf5e7; color: #166534; }
   .msg-err { background: #fde8e8; color: #991b1b; }
+  @media (max-width: 640px) {
+    body { padding: 1rem; }
+    h1 { font-size: 1.2rem; }
+    table { background: transparent; box-shadow: none; border-radius: 0; }
+    table thead { display: none; }
+    table, tbody { display: block; }
+    tr { display: block; background: #fff; border-radius: 10px; margin-bottom: .75rem;
+         padding: .75rem 1rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    td { display: block; border: none !important; padding: .15rem 0; }
+    td:nth-child(3) { display: none; }
+    td:nth-child(4), td:nth-child(5) { display: inline-block; vertical-align: middle;
+                                        margin-right: .5rem; margin-top: .5rem; }
+    .add-card { padding: 1rem; }
+    .fields { grid-template-columns: 1fr; }
+    .btn-add { width: 100%; }
+  }
 </style>
 </head>
 <body>
