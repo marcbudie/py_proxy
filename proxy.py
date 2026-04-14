@@ -814,6 +814,21 @@ ADMIN_HTML = """\
   </tbody>
 </table>
 
+<h2 style="max-width:800px;margin-top:2rem;margin-bottom:.75rem;font-size:1rem;font-weight:600;color:#555">TCP routes</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Luisterpoort</th>
+      <th>Backend</th>
+      <th>Status</th>
+      <th>Aan / Uit</th>
+    </tr>
+  </thead>
+  <tbody id="tcp-tbody">
+    <tr><td colspan="4" style="color:#aaa;padding:1.5rem">Laden&hellip;</td></tr>
+  </tbody>
+</table>
+
 <div class="add-card">
   <h2>Route toevoegen</h2>
   <div class="fields">
@@ -906,6 +921,43 @@ async function addRoute() {
   } catch (e) { showMsg('Netwerkfout: ' + e, false); }
 }
 
+async function loadTcp() {
+  try {
+    const r = await fetch('/api/tcp-routes');
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    const routes = await r.json();
+    document.getElementById('tcp-tbody').innerHTML = routes.length ? routes.map(rt => `
+      <tr>
+        <td class="host">:${rt.listen_port}</td>
+        <td class="backend">${esc(rt.name)} &rarr; ${esc(rt.host)}:${rt.port}</td>
+        <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
+        <td>
+          <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
+            <input type="checkbox" ${rt.enabled ? 'checked' : ''}
+                   onchange='toggleTcp(${rt.listen_port}, this)'>
+            <span class="slider"></span>
+          </label>
+        </td>
+      </tr>
+    `).join('') : '<tr><td colspan="4" style="color:#aaa;padding:1.5rem">Geen TCP routes geconfigureerd.</td></tr>';
+  } catch (e) { showMsg('Kon TCP routes niet laden: ' + e, false); }
+}
+
+async function toggleTcp(port, el) {
+  el.disabled = true;
+  try {
+    const r = await fetch('/api/tcp-routes/' + port + '/toggle', {method: 'POST'});
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    if (!r.ok) { el.checked = !el.checked; showMsg('Fout bij omschakelen van poort ' + port, false); return; }
+    const data = await r.json();
+    showMsg(`TCP :${port} is nu ${data.enabled ? 'ingeschakeld' : 'uitgeschakeld'}.`, true);
+    await loadTcp();
+  } catch (e) {
+    el.checked = !el.checked;
+    showMsg('Netwerkfout: ' + e, false);
+  } finally { el.disabled = false; }
+}
+
 async function logout() {
   await fetch('/api/auth/logout', {method: 'POST'});
   window.location.href = '/login';
@@ -925,6 +977,7 @@ function esc(s) {
 }
 
 load();
+loadTcp();
 </script>
 </body>
 </html>
@@ -1169,6 +1222,29 @@ async def handle_admin(
                     json_resp(200, {"hostname": hostname, "enabled": backend.enabled})
             else:
                 json_resp(400, {"error": "Ongeldig verzoek."})
+
+        elif method == "GET" and path == "/api/tcp-routes":
+            routes = [
+                {"listen_port": p, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
+                for p, b in proxy_server.cfg.tcp_routes.items()
+            ]
+            respond(200, "application/json", json.dumps(routes).encode())
+
+        elif method == "POST" and path.startswith("/api/tcp-routes/") and path.endswith("/toggle"):
+            try:
+                listen_port = int(path.strip("/").split("/")[2])
+            except (ValueError, IndexError):
+                json_resp(400, {"error": "Ongeldige poort."})
+            else:
+                backend = proxy_server.cfg.tcp_routes.get(listen_port)
+                if backend is None:
+                    json_resp(404, {"error": "TCP route niet gevonden."})
+                else:
+                    backend.enabled = not backend.enabled
+                    save_config(proxy_server.cfg, proxy_server.config_path)
+                    state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
+                    logger.info(f"TCP route :{listen_port} {state} via admin UI")
+                    json_resp(200, {"listen_port": listen_port, "enabled": backend.enabled})
 
         else:
             respond(404, "text/plain", b"Not found")
