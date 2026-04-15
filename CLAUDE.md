@@ -172,18 +172,30 @@ Na het invullen: `systemctl reload py-proxy` (geen herstart nodig). Als het toke
 
 | Commando | Omschrijving |
 |---------|-------------|
-| `/status` | Toont uptime, actieve verbindingen, alle routes met statistieken en toggle-knoppen |
-| `/help` | Beschikbare commando's |
+| `/status` | Uptime, actieve verbindingen, statistieken per route + toggle-knoppen |
+| `/cert`   | Vervaldatums van alle geconfigureerde certificaten (🟢/🟡/🔴) |
+| `/logs`   | Laatste 30 logregels uit journald |
+| `/reload` | Config herladen zonder herstart (zelfde als `systemctl reload`) |
+| `/help`   | Beschikbare commando's |
 
 ### Toggle-knoppen
 
-Onder `/status` staat een inline-keyboard met één knop per route. Klikken togglet de route direct aan of uit — identiek aan de admin UI. Het bericht wordt daarna automatisch bijgewerkt met de nieuwe staat.
+Onder `/status` staat een inline-keyboard met één knop per route. Klikken togglet de route direct aan of uit — identiek aan de admin UI. Het bericht wordt daarna automatisch bijgewerkt.
+
+### Proactieve meldingen
+
+| Melding | Wanneer |
+|---------|---------|
+| 🟢 Proxy gestart | Bij elke (her)start van de service |
+| ⚠️ Backend onbereikbaar | Bij connect timeout of OS-fout (max 1× per 5 min per backend) |
+| 🔔 Verbinding | Bij elke verbinding op routes met `"notify": true` in config.json |
+| 📊 Dagelijkse samenvatting | Elke dag om 08:00 UTC |
+| ⚠️ Cert verloopt binnenkort | Dagelijks als een cert binnen 30 dagen (🟡) of 14 dagen (🔴) verloopt |
 
 ### Statistieken (runtime, gereset bij herstart)
 
-Per TLS-route: aantal succesvolle verbindingen (`↗`) en geweigerd omdat de route uitgeschakeld was (`✗`).  
-Per TCP-route: idem.  
-Daarnaast: aantal verbindingen met onbekende SNI.
+Per TLS-route: aantal succesvolle verbindingen en geweigerd (route uitgeschakeld).  
+Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 
 ## Bekende valkuilen
 

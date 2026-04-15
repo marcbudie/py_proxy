@@ -63,6 +63,10 @@ _sessions:  dict[str, float]              = {}   # token → expires_at
 _last_code_ts: float                      = 0.0  # tijdstip laatste code-aanvraag
 _verify_attempts: int                     = 0    # foutieve verify-pogingen sinds laatste code
 
+# Alert-cooldowns (voorkomt spam bij aanhoudende backend-problemen)
+_alert_cooldowns: dict[str, float] = {}  # backend_name → tijdstip laatste alert
+_ALERT_COOLDOWN = 300  # maximaal één alert per 5 minuten per backend
+
 # Runtime statistieken (in-memory, gereset bij herstart)
 _stats: dict = {
     "active_tls": 0,   # actieve TLS verbindingen op dit moment
@@ -126,6 +130,7 @@ class Backend:
     enabled: bool = True
     tls_cert: Optional[str] = None
     tls_key:  Optional[str] = None
+    notify:   bool = False          # stuur Telegram-bericht bij elke verbinding
 
 
 @dataclass
@@ -160,6 +165,7 @@ def _parse_backend(d: dict) -> Backend:
         enabled=d.get("enabled", True),
         tls_cert=d.get("tls_cert"),
         tls_key=d.get("tls_key"),
+        notify=d.get("notify", False),
     )
 
 
@@ -213,6 +219,7 @@ def save_config(cfg: Config, path: Path) -> None:
             h: {k: v for k, v in {
                 "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
                 "tls_cert": b.tls_cert, "tls_key": b.tls_key,
+                "notify": b.notify or None,
             }.items() if v is not None or k in ("host", "port", "name", "enabled")}
             for h, b in cfg.tls_routes.items()
         },
@@ -568,15 +575,21 @@ async def handle_connection(
             )
         except asyncio.TimeoutError:
             logger.error(f"[{src}] connect timeout → {backend.name} ({backend.host}:{backend.port})")
+            asyncio.create_task(_tg_alert_backend(
+                backend.name, f"connect timeout ({cfg.connect_timeout}s)", cfg))
             return
         except OSError as exc:
             logger.error(f"[{src}] cannot connect → {backend.name} ({backend.host}:{backend.port}): {exc}")
+            asyncio.create_task(_tg_alert_backend(backend.name, str(exc), cfg))
             return
 
         sni_key = sni.lower()
         _stats["tls_ok"][sni_key] = _stats["tls_ok"].get(sni_key, 0) + 1
         _stats["active_tls"] += 1
         _is_active = True
+
+        if backend.notify and cfg.telegram.bot_token:
+            asyncio.create_task(_tg_notify_connect(sni, backend, cfg))
 
         be_writer.write(initial)
         await be_writer.drain()
@@ -1343,9 +1356,12 @@ async def handle_tcp_connection(
             )
         except asyncio.TimeoutError:
             logger.error(f"[{src}] TCP connect timeout → {backend.name}")
+            asyncio.create_task(_tg_alert_backend(
+                backend.name, f"TCP connect timeout ({cfg.connect_timeout}s)", cfg))
             return
         except OSError as exc:
             logger.error(f"[{src}] TCP connect failed → {backend.name}: {exc}")
+            asyncio.create_task(_tg_alert_backend(backend.name, f"TCP: {exc}", cfg))
             return
         _stats["tcp_ok"][backend.name] = _stats["tcp_ok"].get(backend.name, 0) + 1
         _stats["active_tcp"] += 1
@@ -1643,6 +1659,30 @@ def _tg_call(token: str, method: str, params: dict | None = None, timeout: int =
         raise RuntimeError(f"Telegram {method} HTTP {exc.code}: {body}") from exc
 
 
+async def _tg_broadcast(token: str, allowed_ids: list, text: str) -> None:
+    """Stuur een bericht naar alle toegestane chat-IDs."""
+    for chat_id in allowed_ids:
+        try:
+            await asyncio.to_thread(_tg_call, token, "sendMessage", {
+                "chat_id": chat_id, "text": text, "parse_mode": "HTML",
+            })
+        except Exception as exc:
+            logger.warning(f"Telegram broadcast naar {chat_id} mislukt: {exc}")
+
+
+def _cert_expiry(cert_path: str) -> Optional[datetime]:
+    """Geeft de vervaldatum van een PEM-certificaat terug via openssl."""
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-noout", "-enddate", "-in", cert_path],
+            capture_output=True, text=True, timeout=5,
+        )
+        date_str = result.stdout.strip().split("=", 1)[1]
+        return datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def _fmt_uptime(since: float) -> str:
     secs = max(0, int(time.time() - since))
     h, rem = divmod(secs, 3600)
@@ -1714,6 +1754,69 @@ async def _tg_edit_status(token: str, chat_id: int, message_id: int, cfg: "Confi
     })
 
 
+async def _tg_alert_backend(name: str, error: str, cfg: "Config") -> None:
+    """Stuur een backend-alert (maximaal één per 5 minuten per backend)."""
+    if not cfg.telegram.bot_token:
+        return
+    now = time.time()
+    if now - _alert_cooldowns.get(name, 0) < _ALERT_COOLDOWN:
+        return
+    _alert_cooldowns[name] = now
+    await _tg_broadcast(cfg.telegram.bot_token, cfg.telegram.allowed_chat_ids,
+                        f"⚠️ <b>Backend onbereikbaar</b>\n\n<b>{name}</b>: {error}")
+
+
+async def _tg_notify_connect(sni: str, backend: "Backend", cfg: "Config") -> None:
+    """Stuur een verbindingsnotificatie voor routes met notify=true."""
+    await _tg_broadcast(cfg.telegram.bot_token, cfg.telegram.allowed_chat_ids,
+                        f"🔔 Verbinding: <b>{backend.name}</b>  <code>{sni}</code>")
+
+
+async def _tg_cmd_cert(token: str, chat_id: int, cfg: "Config") -> None:
+    """Toon vervaldatums van alle geconfigureerde certificaten."""
+    now = datetime.now(timezone.utc)
+    certs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    if cfg.tls_cert and cfg.tls_cert not in seen:
+        certs.append(("Wildcard", cfg.tls_cert))
+        seen.add(cfg.tls_cert)
+    for be in cfg.tls_routes.values():
+        if be.tls_cert and be.tls_cert not in seen:
+            certs.append((be.name, be.tls_cert))
+            seen.add(be.tls_cert)
+
+    lines = ["<b>Certificaten</b>\n"]
+    for label, path in certs:
+        expiry = await asyncio.to_thread(_cert_expiry, path)
+        if expiry:
+            days = (expiry - now).days
+            icon = "🔴" if days <= 14 else ("🟡" if days <= 30 else "🟢")
+            lines.append(f"{icon} <b>{label}</b> — {days} dagen  ({expiry.strftime('%d %b %Y')})")
+        else:
+            lines.append(f"❓ <b>{label}</b> — onbekend")
+
+    await asyncio.to_thread(_tg_call, token, "sendMessage", {
+        "chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML",
+    })
+
+
+async def _tg_cmd_logs(token: str, chat_id: int) -> None:
+    """Stuur de laatste 30 logregels."""
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["journalctl", "-u", "py-proxy", "-n", "30", "--no-pager", "--output=short"],
+        capture_output=True, text=True, timeout=10,
+    )
+    text = result.stdout.strip() or "(geen logs)"
+    if len(text) > 3900:
+        text = "…\n" + text[-3900:]
+    await asyncio.to_thread(_tg_call, token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": f"<pre>{html.escape(text)}</pre>",
+        "parse_mode": "HTML",
+    })
+
+
 async def _tg_send_otp(code: str, cfg: "Config") -> None:
     """Stuur OTP-code naar alle toegestane Telegram chat-IDs."""
     token = cfg.telegram.bot_token
@@ -1750,11 +1853,22 @@ async def _tg_handle_message(
             "chat_id": chat_id,
             "text": (
                 "<b>Commando's</b>\n\n"
-                "/status — routes en statistieken\n"
-                "/help   — dit bericht\n\n"
-                "Gebruik de knoppen onder /status om routes aan/uit te zetten."
+                "/status — routes, statistieken en toggle-knoppen\n"
+                "/cert   — vervaldatums van alle certificaten\n"
+                "/logs   — laatste 30 logregels\n"
+                "/reload — config herladen (zonder herstart)\n"
+                "/help   — dit bericht"
             ),
             "parse_mode": "HTML",
+        })
+    elif command == "/cert":
+        await _tg_cmd_cert(token, chat_id, proxy.cfg)
+    elif command == "/logs":
+        await _tg_cmd_logs(token, chat_id)
+    elif command == "/reload":
+        proxy.reload()
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id, "text": "✅ Config herladen.",
         })
     else:
         await asyncio.to_thread(_tg_call, token, "sendMessage", {
@@ -1931,14 +2045,70 @@ class ProxyServer:
 
         if self.cfg.telegram.bot_token:
             self._tg_task = asyncio.create_task(self._telegram_bot_loop())
+            self._daily_task = asyncio.create_task(self._daily_task_loop())
             logger.info("Telegram bot gestart")
         else:
+            self._daily_task = None
             logger.info("Telegram bot niet geconfigureerd (geen bot_token in config.json)")
 
         await asyncio.gather(*(srv.serve_forever() for srv in self._servers))
 
+    async def _daily_task_loop(self) -> None:
+        """Dagelijks om 08:00 UTC: stuur statussamenvatting en check cert-vervaldatums."""
+        from datetime import timedelta
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
+                if next_run <= now:
+                    next_run += timedelta(days=1)
+                await asyncio.sleep((next_run - now).total_seconds())
+
+                token = self.cfg.telegram.bot_token
+                if not token:
+                    continue
+
+                # Dagelijkse statussamenvatting
+                await _tg_broadcast(token, self.cfg.telegram.allowed_chat_ids,
+                                    f"📊 <b>Dagelijkse samenvatting</b>\n\n{_tg_status_text(self.cfg)}")
+
+                # Cert-vervaldatums controleren
+                now_utc = datetime.now(timezone.utc)
+                warnings = []
+                seen: set[str] = set()
+                certs: list[tuple[str, str]] = []
+                if self.cfg.tls_cert:
+                    certs.append(("Wildcard", self.cfg.tls_cert))
+                    seen.add(self.cfg.tls_cert)
+                for be in self.cfg.tls_routes.values():
+                    if be.tls_cert and be.tls_cert not in seen:
+                        certs.append((be.name, be.tls_cert))
+                        seen.add(be.tls_cert)
+                for label, path in certs:
+                    expiry = await asyncio.to_thread(_cert_expiry, path)
+                    if expiry:
+                        days = (expiry - now_utc).days
+                        if days <= 30:
+                            icon = "🔴" if days <= 14 else "🟡"
+                            warnings.append(f"{icon} <b>{label}</b>: verloopt over {days} dagen")
+                if warnings:
+                    await _tg_broadcast(token, self.cfg.telegram.allowed_chat_ids,
+                                        "⚠️ <b>Certificaten verlopen binnenkort</b>\n\n" + "\n".join(warnings))
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning(f"Dagelijkse taak fout: {exc}")
+                await asyncio.sleep(3600)
+
     async def _telegram_bot_loop(self) -> None:
         offset = 0
+        # Opstartmelding
+        token  = self.cfg.telegram.bot_token
+        allowed = self.cfg.telegram.allowed_chat_ids
+        try:
+            await _tg_broadcast(token, allowed, "🟢 <b>Proxy gestart</b>")
+        except Exception as exc:
+            logger.warning(f"Telegram opstartmelding mislukt: {exc}")
         while True:
             try:
                 token      = self.cfg.telegram.bot_token
@@ -1967,8 +2137,9 @@ class ProxyServer:
     def _stop_all(self) -> None:
         for srv in getattr(self, "_servers", []):
             srv.close()
-        if self._tg_task and not self._tg_task.done():
-            self._tg_task.cancel()
+        for task in (self._tg_task, getattr(self, "_daily_task", None)):
+            if task and not task.done():
+                task.cancel()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
