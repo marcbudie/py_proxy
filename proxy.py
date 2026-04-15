@@ -2409,9 +2409,24 @@ class ProxyServer:
 
     async def _telegram_bot_loop(self) -> None:
         offset = 0
-        # Opstartmelding
-        token  = self.cfg.telegram.bot_token
+        token   = self.cfg.telegram.bot_token
         allowed = self.cfg.telegram.allowed_chat_ids
+
+        # Stel menu-knop in zodat de Mini App direct opent zonder commando
+        if self.cfg.telegram.mini_app_url:
+            try:
+                await asyncio.to_thread(_tg_call, token, "setMyDefaultMenuButton", {
+                    "menu_button": {
+                        "type": "web_app",
+                        "text": "Beheer",
+                        "web_app": {"url": self.cfg.telegram.mini_app_url},
+                    }
+                })
+                logger.info("Telegram menu-knop ingesteld")
+            except Exception as exc:
+                logger.warning(f"Telegram menu-knop instellen mislukt: {exc}")
+
+        # Opstartmelding
         try:
             await _tg_broadcast(token, allowed, "🟢 <b>Proxy gestart</b>")
         except Exception as exc:
