@@ -29,7 +29,9 @@ import subprocess
 import sys
 import termios
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -61,6 +63,18 @@ _sessions:  dict[str, float]              = {}   # token → expires_at
 _last_code_ts: float                      = 0.0  # tijdstip laatste code-aanvraag
 _verify_attempts: int                     = 0    # foutieve verify-pogingen sinds laatste code
 
+# Runtime statistieken (in-memory, gereset bij herstart)
+_stats: dict = {
+    "active_tls": 0,   # actieve TLS verbindingen op dit moment
+    "active_tcp": 0,   # actieve TCP verbindingen op dit moment
+    "tls_ok":  {},     # sni → aantal succesvolle verbindingen
+    "tls_rej": {},     # sni → aantal geweigerd (route uitgeschakeld)
+    "tls_unknown": 0,  # verbindingen zonder bekende SNI
+    "tcp_ok":  {},     # name → aantal succesvolle verbindingen
+    "tcp_rej": {},     # name → aantal geweigerd (route uitgeschakeld)
+    "since":   0.0,    # timestamp proxy-start (gezet in ProxyServer.__init__)
+}
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -80,6 +94,10 @@ DEFAULT_CONFIG: dict = {
         "gmail_app_password": "",
         "to": "marc.budie@gmail.com",
     },
+    "telegram": {
+        "bot_token": "",
+        "allowed_chat_ids": [],
+    },
 }
 
 
@@ -88,6 +106,16 @@ class EmailConfig:
     gmail_user: str = ""
     gmail_app_password: str = ""
     to: str = "marc.budie@gmail.com"
+
+
+@dataclass
+class TelegramConfig:
+    bot_token: str = ""
+    allowed_chat_ids: list = None   # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.allowed_chat_ids is None:
+            self.allowed_chat_ids = []
 
 
 @dataclass
@@ -113,12 +141,15 @@ class Config:
     tls_key:  Optional[str] = None
     email: EmailConfig = None
     tcp_routes: dict = None           # listen_port (int) → Backend
+    telegram: TelegramConfig = None
 
     def __post_init__(self):
         if self.email is None:
             self.email = EmailConfig()
         if self.tcp_routes is None:
             self.tcp_routes = {}
+        if self.telegram is None:
+            self.telegram = TelegramConfig()
 
 
 def _parse_backend(d: dict) -> Backend:
@@ -152,6 +183,12 @@ def load_config(path: Path) -> Config:
         to=ec.get("to", "marc.budie@gmail.com"),
     )
 
+    tc = raw.get("telegram", {})
+    telegram_cfg = TelegramConfig(
+        bot_token=tc.get("bot_token", ""),
+        allowed_chat_ids=tc.get("allowed_chat_ids", []),
+    )
+
     return Config(
         listen_host=raw.get("listen_host", "0.0.0.0"),
         listen_ports=raw_ports,
@@ -164,6 +201,7 @@ def load_config(path: Path) -> Config:
         tls_key=raw.get("tls_key"),
         email=email_cfg,
         tcp_routes={int(p): _parse_backend(b) for p, b in raw.get("tcp_routes", {}).items()},
+        telegram=telegram_cfg,
     )
 
 
@@ -192,6 +230,10 @@ def save_config(cfg: Config, path: Path) -> None:
         "tcp_routes": {
             str(p): {"host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
             for p, b in cfg.tcp_routes.items()
+        },
+        "telegram": {
+            "bot_token": cfg.telegram.bot_token,
+            "allowed_chat_ids": cfg.telegram.allowed_chat_ids,
         },
     }
     path.write_text(json.dumps(data, indent=2))
@@ -478,6 +520,7 @@ async def handle_connection(
     peer = client_writer.get_extra_info("peername") or ("?", 0)
     src = f"{peer[0]}:{peer[1]}"
     started = time.monotonic()
+    _is_active = False
 
     try:
         try:
@@ -493,14 +536,18 @@ async def handle_connection(
 
         sni = extract_sni(initial)
         if not sni:
+            _stats["tls_unknown"] += 1
             return
 
         backend = cfg.tls_routes.get(sni.lower())
         if not backend:
+            _stats["tls_unknown"] += 1
             logger.warning(f"[{src}] SNI={sni} — no route configured, dropped")
             return
 
         if not backend.enabled:
+            sni_key = sni.lower()
+            _stats["tls_rej"][sni_key] = _stats["tls_rej"].get(sni_key, 0) + 1
             ssl_ctx = server._ssl_ctx_for(backend)
             if ssl_ctx:
                 logger.info(f"[{src}] SNI={sni} — route disabled, sending error page")
@@ -526,6 +573,11 @@ async def handle_connection(
             logger.error(f"[{src}] cannot connect → {backend.name} ({backend.host}:{backend.port}): {exc}")
             return
 
+        sni_key = sni.lower()
+        _stats["tls_ok"][sni_key] = _stats["tls_ok"].get(sni_key, 0) + 1
+        _stats["active_tls"] += 1
+        _is_active = True
+
         be_writer.write(initial)
         await be_writer.drain()
 
@@ -543,6 +595,8 @@ async def handle_connection(
     except Exception as exc:
         logger.exception(f"[{src}] unhandled error: {exc}")
     finally:
+        if _is_active:
+            _stats["active_tls"] -= 1
         try:
             client_writer.close()
             await client_writer.wait_closed()
@@ -1275,8 +1329,10 @@ async def handle_tcp_connection(
     cfg: Config,
 ) -> None:
     src = writer.get_extra_info("peername")
+    _is_active = False
     try:
         if not backend.enabled:
+            _stats["tcp_rej"][backend.name] = _stats["tcp_rej"].get(backend.name, 0) + 1
             logger.info(f"[{src}] TCP:{backend.name} — route disabled, dropped")
             return
         logger.info(f"[{src}] TCP → {backend.name} ({backend.host}:{backend.port})")
@@ -1291,6 +1347,9 @@ async def handle_tcp_connection(
         except OSError as exc:
             logger.error(f"[{src}] TCP connect failed → {backend.name}: {exc}")
             return
+        _stats["tcp_ok"][backend.name] = _stats["tcp_ok"].get(backend.name, 0) + 1
+        _stats["active_tcp"] += 1
+        _is_active = True
         await asyncio.gather(
             pipe(reader, be_writer, f"{src}→{backend.name}"),
             pipe(be_reader, writer, f"{backend.name}→{src}"),
@@ -1298,6 +1357,8 @@ async def handle_tcp_connection(
     except Exception as exc:
         logger.exception(f"[{src}] TCP unhandled: {exc}")
     finally:
+        if _is_active:
+            _stats["active_tcp"] -= 1
         try:
             writer.close()
             await writer.wait_closed()
@@ -1552,6 +1613,178 @@ async def handle_admin(
             pass
 
 
+# ── Telegram bot ─────────────────────────────────────────────────────────────
+
+def _tg_call(token: str, method: str, params: dict | None = None, timeout: int = 35) -> dict:
+    """Blocking Telegram API call — gebruik via asyncio.to_thread."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = json.dumps(params or {}).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"Telegram {method} HTTP {exc.code}: {body}") from exc
+
+
+def _fmt_uptime(since: float) -> str:
+    secs = max(0, int(time.time() - since))
+    h, rem = divmod(secs, 3600)
+    m = rem // 60
+    return f"{h}u {m}m" if h else f"{m}m"
+
+
+def _tg_status_text(cfg: "Config") -> str:
+    uptime = _fmt_uptime(_stats["since"]) if _stats["since"] else "?"
+    lines = [
+        f"<b>Proxy</b> — uptime {uptime}",
+        f"Actief: {_stats['active_tls']} TLS · {_stats['active_tcp']} TCP",
+    ]
+
+    if cfg.tls_routes:
+        lines.append("")
+        lines.append("<b>TLS routes</b>")
+        for hostname, be in cfg.tls_routes.items():
+            icon = "✅" if be.enabled else "❌"
+            ok  = _stats["tls_ok"].get(hostname, 0)
+            rej = _stats["tls_rej"].get(hostname, 0)
+            stat = f"{ok}↗" + (f"  {rej}✗" if rej else "")
+            lines.append(f"{icon} <b>{be.name}</b>  <code>{hostname}</code>")
+            lines.append(f"     → {be.host}:{be.port}  {stat}")
+
+    if cfg.tcp_routes:
+        lines.append("")
+        lines.append("<b>TCP routes</b>")
+        for port, be in cfg.tcp_routes.items():
+            icon = "✅" if be.enabled else "❌"
+            ok  = _stats["tcp_ok"].get(be.name, 0)
+            rej = _stats["tcp_rej"].get(be.name, 0)
+            stat = f"{ok}↗" + (f"  {rej}✗" if rej else "")
+            lines.append(f"{icon} <b>{be.name}</b>  <code>:{port}</code> → {be.host}:{be.port}  {stat}")
+
+    if _stats["tls_unknown"]:
+        lines.append(f"\n⚠️ Onbekende SNI: {_stats['tls_unknown']}×")
+
+    return "\n".join(lines)
+
+
+def _tg_toggle_keyboard(cfg: "Config") -> dict:
+    """Inline keyboard met één knop per route."""
+    rows = []
+    for hostname, be in cfg.tls_routes.items():
+        icon = "✅" if be.enabled else "❌"
+        rows.append([{"text": f"{icon} {be.name}", "callback_data": f"tls:{hostname}"[:64]}])
+    for port, be in cfg.tcp_routes.items():
+        icon = "✅" if be.enabled else "❌"
+        rows.append([{"text": f"{icon} {be.name} (TCP)", "callback_data": f"tcp:{port}"}])
+    return {"inline_keyboard": rows}
+
+
+async def _tg_send_status(token: str, chat_id: int, cfg: "Config") -> None:
+    await asyncio.to_thread(_tg_call, token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": _tg_status_text(cfg),
+        "parse_mode": "HTML",
+        "reply_markup": _tg_toggle_keyboard(cfg),
+    })
+
+
+async def _tg_edit_status(token: str, chat_id: int, message_id: int, cfg: "Config") -> None:
+    await asyncio.to_thread(_tg_call, token, "editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": _tg_status_text(cfg),
+        "parse_mode": "HTML",
+        "reply_markup": _tg_toggle_keyboard(cfg),
+    })
+
+
+async def _tg_handle_message(
+    message: dict, token: str, allowed_ids: list, proxy: "ProxyServer"
+) -> None:
+    chat_id = message["chat"]["id"]
+    if allowed_ids and chat_id not in allowed_ids:
+        logger.warning(f"Telegram: bericht van niet-toegestane chat_id {chat_id}")
+        return
+    text = message.get("text", "").strip()
+    if not text.startswith("/"):
+        return
+    command = text.split()[0].lower().split("@")[0]
+    if command in ("/status", "/start"):
+        await _tg_send_status(token, chat_id, proxy.cfg)
+    elif command == "/help":
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                "<b>Commando's</b>\n\n"
+                "/status — routes en statistieken\n"
+                "/help   — dit bericht\n\n"
+                "Gebruik de knoppen onder /status om routes aan/uit te zetten."
+            ),
+            "parse_mode": "HTML",
+        })
+    else:
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id, "text": "Onbekend commando. Gebruik /help.",
+        })
+
+
+async def _tg_handle_callback(
+    callback: dict, token: str, allowed_ids: list, proxy: "ProxyServer"
+) -> None:
+    chat_id    = callback["message"]["chat"]["id"]
+    cb_id      = callback["id"]
+    message_id = callback["message"]["message_id"]
+    data       = callback.get("data", "")
+
+    if allowed_ids and chat_id not in allowed_ids:
+        return
+
+    toggled_name: Optional[str] = None
+    new_state: Optional[bool]   = None
+
+    if data.startswith("tls:"):
+        hostname = data[4:]
+        backend  = proxy.cfg.tls_routes.get(hostname)
+        if not backend:
+            await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
+                                    {"callback_query_id": cb_id, "text": "Route niet gevonden"})
+            return
+        backend.enabled = not backend.enabled
+        save_config(proxy.cfg, proxy.config_path)
+        state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
+        logger.info(f"Telegram: TLS route {hostname} {state}")
+        toggled_name, new_state = backend.name, backend.enabled
+
+    elif data.startswith("tcp:"):
+        try:
+            port = int(data[4:])
+        except ValueError:
+            return
+        backend = proxy.cfg.tcp_routes.get(port)
+        if not backend:
+            await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
+                                    {"callback_query_id": cb_id, "text": "TCP route niet gevonden"})
+            return
+        backend.enabled = not backend.enabled
+        save_config(proxy.cfg, proxy.config_path)
+        state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
+        logger.info(f"Telegram: TCP route :{port} {state}")
+        toggled_name, new_state = backend.name, backend.enabled
+
+    if toggled_name is not None:
+        icon = "✅" if new_state else "❌"
+        await asyncio.to_thread(_tg_call, token, "answerCallbackQuery", {
+            "callback_query_id": cb_id,
+            "text": f"{icon} {toggled_name} {'aan' if new_state else 'uit'}",
+        })
+        try:
+            await _tg_edit_status(token, chat_id, message_id, proxy.cfg)
+        except Exception as exc:
+            logger.debug(f"Telegram: editMessageText mislukt: {exc}")
+
+
 # ── Server ────────────────────────────────────────────────────────────────────
 
 class ProxyServer:
@@ -1559,6 +1792,8 @@ class ProxyServer:
         self.config_path = config_path
         self.cfg = load_config(config_path)
         self._ssl_ctxs: dict[tuple[str, str], ssl.SSLContext] = self._load_ssl_ctxs()
+        self._tg_task: Optional[asyncio.Task] = None
+        _stats["since"] = time.time()
 
     def _load_ssl_ctxs(self) -> dict[tuple[str, str], ssl.SSLContext]:
         ctxs: dict[tuple[str, str], ssl.SSLContext] = {}
@@ -1606,12 +1841,21 @@ class ProxyServer:
 
     def reload(self) -> None:
         logger.info("SIGHUP received — reloading config")
+        old_token = self.cfg.telegram.bot_token
         try:
             self.cfg = load_config(self.config_path)
             self._ssl_ctxs = self._load_ssl_ctxs()
             log_config(self.cfg)
         except Exception as exc:
             logger.error(f"Config reload failed: {exc} — keeping old config")
+            return
+        # Herstart Telegram bot als het token is gewijzigd
+        new_token = self.cfg.telegram.bot_token
+        if old_token != new_token:
+            if self._tg_task and not self._tg_task.done():
+                self._tg_task.cancel()
+            if new_token:
+                self._tg_task = asyncio.create_task(self._telegram_bot_loop())
 
     async def run(self) -> None:
         log_config(self.cfg)
@@ -1653,11 +1897,46 @@ class ProxyServer:
         loop.add_signal_handler(signal.SIGHUP, self.reload)
         loop.add_signal_handler(signal.SIGTERM, self._stop_all)
 
+        if self.cfg.telegram.bot_token:
+            self._tg_task = asyncio.create_task(self._telegram_bot_loop())
+            logger.info("Telegram bot gestart")
+        else:
+            logger.info("Telegram bot niet geconfigureerd (geen bot_token in config.json)")
+
         await asyncio.gather(*(srv.serve_forever() for srv in self._servers))
+
+    async def _telegram_bot_loop(self) -> None:
+        offset = 0
+        while True:
+            try:
+                token      = self.cfg.telegram.bot_token
+                allowed    = self.cfg.telegram.allowed_chat_ids
+                result     = await asyncio.to_thread(
+                    _tg_call, token, "getUpdates",
+                    {"offset": offset, "timeout": 30}, 35,
+                )
+                for update in result.get("result", []):
+                    offset = update["update_id"] + 1
+                    try:
+                        if "message" in update or "edited_message" in update:
+                            msg = update.get("message") or update["edited_message"]
+                            await _tg_handle_message(msg, token, allowed, self)
+                        elif "callback_query" in update:
+                            await _tg_handle_callback(update["callback_query"], token, allowed, self)
+                    except Exception as exc:
+                        logger.error(f"Telegram update {update.get('update_id')} fout: {exc}")
+            except asyncio.CancelledError:
+                logger.info("Telegram bot gestopt")
+                return
+            except Exception as exc:
+                logger.warning(f"Telegram polling fout: {exc} — wacht 10s")
+                await asyncio.sleep(10)
 
     def _stop_all(self) -> None:
         for srv in getattr(self, "_servers", []):
             srv.close()
+        if self._tg_task and not self._tg_task.done():
+            self._tg_task.cancel()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

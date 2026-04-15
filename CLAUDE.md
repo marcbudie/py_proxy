@@ -75,6 +75,10 @@ python3 proxy.py pad/naar/config.json
     "gmail_user": "jouw@gmail.com",
     "gmail_app_password": "app-wachtwoord",
     "to": "jouw@gmail.com"
+  },
+  "telegram": {
+    "bot_token": "123456:ABC...",
+    "allowed_chat_ids": [123456789]
   }
 }
 ```
@@ -144,10 +148,47 @@ E-mail wordt verstuurd via Gmail SMTP met een app-wachtwoord (`gmail_user` + `gm
 | GET | `/api/tcp-routes` | Lijst van alle TCP routes |
 | POST | `/api/tcp-routes/<port>/toggle` | TCP route aan/uit schakelen |
 
+## Telegram bot
+
+De proxy bevat een ingebouwde Telegram bot die als asyncio-task naast de proxy draait — geen apart proces nodig.
+
+### Configuratie
+
+Voeg toe aan `config.json`:
+
+```json
+"telegram": {
+  "bot_token": "123456:ABC...",
+  "allowed_chat_ids": [123456789]
+}
+```
+
+- `bot_token` — token van de BotFather
+- `allowed_chat_ids` — lijst van toegestane chat-IDs (leeg = iedereen, niet aanbevolen)
+
+Na het invullen: `systemctl reload py-proxy` (geen herstart nodig). Als het token wijzigt wordt de bot automatisch herstart bij reload.
+
+### Commando's
+
+| Commando | Omschrijving |
+|---------|-------------|
+| `/status` | Toont uptime, actieve verbindingen, alle routes met statistieken en toggle-knoppen |
+| `/help` | Beschikbare commando's |
+
+### Toggle-knoppen
+
+Onder `/status` staat een inline-keyboard met één knop per route. Klikken togglet de route direct aan of uit — identiek aan de admin UI. Het bericht wordt daarna automatisch bijgewerkt met de nieuwe staat.
+
+### Statistieken (runtime, gereset bij herstart)
+
+Per TLS-route: aantal succesvolle verbindingen (`↗`) en geweigerd omdat de route uitgeschakeld was (`✗`).  
+Per TCP-route: idem.  
+Daarnaast: aantal verbindingen met onbekende SNI.
+
 ## Bekende valkuilen
 
 - Admin poort is 9443 — HTTPS verplicht, proxy weigert te starten zonder geldig `tls_cert`/`tls_key`.
-- `config.json` staat niet in git vanwege het Gmail app-wachtwoord — na een verse checkout handmatig aanmaken.
+- `config.json` staat niet in git vanwege het Gmail app-wachtwoord en Telegram bot-token — na een verse checkout handmatig aanmaken.
 - De admin UI gebruikt `Connection: keep-alive` met een `while True` loop zodat de TLS-verbinding open blijft na een response. Zonder keep-alive stuurt asyncio's SSL-transport een TCP RST als de browser's `close_notify` nog in de buffer zit.
 - `onchange`-attribuut in de admin UI gebruikt enkele aanhalingstekens — `JSON.stringify` geeft dubbele aanhalingstekens terug die het HTML-attribuut anders zouden breken.
 - Pad-gebaseerde routing (hostname + pad) is geprobeerd maar werkt niet betrouwbaar voor applicaties zoals pfSense die URLs dynamisch opbouwen in JavaScript. Gebruik altijd een eigen subdomein per applicatie.
