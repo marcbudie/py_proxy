@@ -1455,7 +1455,10 @@ MINI_APP_HTML = """\
 </div>
 <div id="main"><div class="msg">Laden&#x2026;</div></div>
 <div class="bottom-bar">
-  <button class="btn" id="btn-reload" onclick="reloadCfg()">&#x21BA; Config herladen</button>
+  <div style="display:flex;gap:10px">
+    <button class="btn" id="btn-refresh" onclick="refresh()" style="flex:0 0 auto;width:48px;font-size:20px;padding:14px 0">&#x1F504;</button>
+    <button class="btn" id="btn-reload" onclick="reloadCfg()" style="flex:1">&#x21BA; Config herladen</button>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
 <script>
@@ -1526,6 +1529,13 @@ async function tog(cb){
     toast(d.enabled?'\\u2705 Ingeschakeld':'\\u274C Uitgeschakeld');
   }catch{cb.checked=!cb.checked;toast('Toggle mislukt');}
   cb.disabled=false;
+}
+
+async function refresh(){
+  const b=document.getElementById('btn-refresh');
+  b.disabled=true;
+  await load();
+  b.disabled=false;
 }
 
 async function reloadCfg(){
