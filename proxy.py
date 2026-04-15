@@ -2161,6 +2161,7 @@ async def _tg_handle_message(
                 "/cert   — vervaldatums van alle certificaten\n"
                 "/logs   — laatste 30 logregels\n"
                 "/reload — config herladen (zonder herstart)\n"
+                "/clear  — verbindingstellers resetten\n"
                 "/help   — dit bericht"
             ),
             "parse_mode": "HTML",
@@ -2173,6 +2174,16 @@ async def _tg_handle_message(
         proxy.reload()
         await asyncio.to_thread(_tg_call, token, "sendMessage", {
             "chat_id": chat_id, "text": "✅ Config herladen.",
+        })
+    elif command == "/clear":
+        _stats["tls_ok"].clear()
+        _stats["tls_rej"].clear()
+        _stats["tcp_ok"].clear()
+        _stats["tcp_rej"].clear()
+        _stats["tls_unknown"] = 0
+        logger.info("Telegram: statistieken gereset via /clear")
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id, "text": "✅ Tellers gereset.",
         })
     else:
         await asyncio.to_thread(_tg_call, token, "sendMessage", {
