@@ -2179,7 +2179,8 @@ async def _tg_handle_message(
                 "/logs   — laatste 30 logregels\n"
                 "/reload — config herladen (zonder herstart)\n"
                 "/clear  — verbindingstellers resetten\n"
-                "/proxy  — proxy.budie.eu aan/uit schakelen\n"
+                "/proxyaan — proxy.budie.eu inschakelen\n"
+                "/proxyuit — proxy.budie.eu uitschakelen\n"
                 "/help   — dit bericht"
             ),
             "parse_mode": "HTML",
@@ -2203,18 +2204,18 @@ async def _tg_handle_message(
         await asyncio.to_thread(_tg_call, token, "sendMessage", {
             "chat_id": chat_id, "text": "✅ Tellers gereset.",
         })
-    elif command == "/proxy":
+    elif command in ("/proxyaan", "/proxyuit"):
         backend = proxy.cfg.tls_routes.get("proxy.budie.eu")
         if not backend:
             await asyncio.to_thread(_tg_call, token, "sendMessage", {
                 "chat_id": chat_id, "text": "⚠️ Route proxy.budie.eu niet gevonden in config.",
             })
         else:
-            backend.enabled = not backend.enabled
+            backend.enabled = command == "/proxyaan"
             save_config(proxy.cfg, proxy.config_path)
             state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
             icon  = "✅" if backend.enabled else "❌"
-            logger.info(f"Telegram: proxy.budie.eu {state} via /proxy")
+            logger.info(f"Telegram: proxy.budie.eu {state} via {command}")
             await asyncio.to_thread(_tg_call, token, "sendMessage", {
                 "chat_id": chat_id, "text": f"{icon} proxy.budie.eu {state}.",
             })
