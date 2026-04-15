@@ -1473,18 +1473,33 @@ async def handle_admin(
             remaining = CODE_COOLDOWN - (now - _last_code_ts)
             if remaining > 0:
                 json_resp(429, {"error": f"Wacht nog {int(remaining)+1} seconden voor een nieuwe code."})
-            elif not proxy_server.cfg.email.gmail_user:
-                json_resp(500, {"error": "E-mail niet geconfigureerd in config.json."})
+            elif not proxy_server.cfg.email.gmail_user and not proxy_server.cfg.telegram.bot_token:
+                json_resp(500, {"error": "Geen e-mail of Telegram geconfigureerd in config.json."})
             else:
                 code = _generate_otp()
                 _last_code_ts = now
-                try:
-                    await send_otp_email(code, proxy_server.cfg.email)
-                    logger.info(f"OTP-code verstuurd naar {proxy_server.cfg.email.to}")
+                sent_via = []
+                errors = []
+                if proxy_server.cfg.email.gmail_user:
+                    try:
+                        await send_otp_email(code, proxy_server.cfg.email)
+                        logger.info(f"OTP-code verstuurd naar {proxy_server.cfg.email.to}")
+                        sent_via.append("e-mail")
+                    except Exception as exc:
+                        logger.error(f"E-mail versturen mislukt: {exc}")
+                        errors.append("e-mail")
+                if proxy_server.cfg.telegram.bot_token:
+                    try:
+                        await _tg_send_otp(code, proxy_server.cfg)
+                        logger.info("OTP-code verstuurd via Telegram")
+                        sent_via.append("Telegram")
+                    except Exception as exc:
+                        logger.error(f"Telegram OTP versturen mislukt: {exc}")
+                        errors.append("Telegram")
+                if sent_via:
                     json_resp(200, {"ok": True})
-                except Exception as exc:
-                    logger.error(f"E-mail versturen mislukt: {exc}")
-                    json_resp(500, {"error": "E-mail versturen mislukt. Controleer de e-mailconfiguratie."})
+                else:
+                    json_resp(500, {"error": f"Versturen mislukt via: {', '.join(errors)}"})
 
         elif method == "POST" and path == "/api/auth/verify":
             try:
@@ -1649,9 +1664,8 @@ def _tg_status_text(cfg: "Config") -> str:
             icon = "✅" if be.enabled else "❌"
             ok  = _stats["tls_ok"].get(hostname, 0)
             rej = _stats["tls_rej"].get(hostname, 0)
-            stat = f"{ok}↗" + (f"  {rej}✗" if rej else "")
-            lines.append(f"{icon} <b>{be.name}</b>  <code>{hostname}</code>")
-            lines.append(f"     → {be.host}:{be.port}  {stat}")
+            stat = f"{ok} verbindingen" + (f", {rej} geweigerd" if rej else "")
+            lines.append(f"{icon} <b>{be.name}</b>  <code>{hostname}</code>  {stat}")
 
     if cfg.tcp_routes:
         lines.append("")
@@ -1660,8 +1674,8 @@ def _tg_status_text(cfg: "Config") -> str:
             icon = "✅" if be.enabled else "❌"
             ok  = _stats["tcp_ok"].get(be.name, 0)
             rej = _stats["tcp_rej"].get(be.name, 0)
-            stat = f"{ok}↗" + (f"  {rej}✗" if rej else "")
-            lines.append(f"{icon} <b>{be.name}</b>  <code>:{port}</code> → {be.host}:{be.port}  {stat}")
+            stat = f"{ok} verbindingen" + (f", {rej} geweigerd" if rej else "")
+            lines.append(f"{icon} <b>{be.name}</b>  <code>:{port}</code>  {stat}")
 
     if _stats["tls_unknown"]:
         lines.append(f"\n⚠️ Onbekende SNI: {_stats['tls_unknown']}×")
@@ -1698,6 +1712,24 @@ async def _tg_edit_status(token: str, chat_id: int, message_id: int, cfg: "Confi
         "parse_mode": "HTML",
         "reply_markup": _tg_toggle_keyboard(cfg),
     })
+
+
+async def _tg_send_otp(code: str, cfg: "Config") -> None:
+    """Stuur OTP-code naar alle toegestane Telegram chat-IDs."""
+    token = cfg.telegram.bot_token
+    if not token:
+        return
+    text = (
+        f"🔐 <b>Inlogcode admin UI</b>\n\n"
+        f"<code>{code}</code>\n\n"
+        f"Geldig 5 minuten. Eenmalig bruikbaar."
+    )
+    for chat_id in cfg.telegram.allowed_chat_ids:
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        })
 
 
 async def _tg_handle_message(

@@ -122,23 +122,23 @@ Wijzigingen worden direct actief en opgeslagen in `config.json` zonder herstart.
 
 ### Authenticatie
 
-De admin UI gebruikt OTP-authenticatie via e-mail:
+De admin UI gebruikt OTP-authenticatie via e-mail en/of Telegram:
 
 1. Bezoek `/login` — klik op "Stuur inlogcode"
-2. Een eenmalige 6-cijferige code wordt gemaild naar het geconfigureerde `to`-adres
+2. Een eenmalige 6-cijferige code wordt verstuurd naar alle geconfigureerde kanalen (e-mail en/of Telegram)
 3. Vul de code in — bij succes wordt een sessiecookie gezet (geldig 30 minuten)
 4. Uitloggen via de knop rechtsboven in de UI
 
 **Limieten:** code is 5 minuten geldig en eenmalig bruikbaar; minimaal 60 seconden tussen aanvragen; na 10 foutieve pogingen wordt de code ongeldig gemaakt.
 
-E-mail wordt verstuurd via Gmail SMTP met een app-wachtwoord (`gmail_user` + `gmail_app_password` in config.json).
+E-mail wordt verstuurd via Gmail SMTP (`gmail_user` + `gmail_app_password` in config.json). Telegram verstuurt de code naar alle `allowed_chat_ids`. Minstens één kanaal moet geconfigureerd zijn; als één kanaal faalt maar het andere slaagt, is inloggen nog steeds mogelijk.
 
 ### API-endpoints
 
 | Methode | Pad | Omschrijving |
 |---------|-----|--------------|
 | GET | `/login` | Inlogpagina (HTML) |
-| POST | `/api/auth/request-code` | Vraag OTP-code aan (verstuurt e-mail) |
+| POST | `/api/auth/request-code` | Vraag OTP-code aan (verstuurt via e-mail en/of Telegram) |
 | POST | `/api/auth/verify` | Verifieer OTP-code, ontvangt sessiecookie |
 | POST | `/api/auth/logout` | Sessie beëindigen |
 | GET | `/api/routes` | Lijst van alle TLS routes |
