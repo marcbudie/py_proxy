@@ -589,7 +589,7 @@ async def handle_connection(
         _is_active = True
 
         if backend.notify and cfg.telegram.bot_token:
-            asyncio.create_task(_tg_notify_connect(sni, backend, cfg))
+            asyncio.create_task(_tg_notify_connect(sni, backend, src, cfg))
 
         be_writer.write(initial)
         await be_writer.drain()
@@ -1766,10 +1766,11 @@ async def _tg_alert_backend(name: str, error: str, cfg: "Config") -> None:
                         f"⚠️ <b>Backend onbereikbaar</b>\n\n<b>{name}</b>: {error}")
 
 
-async def _tg_notify_connect(sni: str, backend: "Backend", cfg: "Config") -> None:
+async def _tg_notify_connect(sni: str, backend: "Backend", src: str, cfg: "Config") -> None:
     """Stuur een verbindingsnotificatie voor routes met notify=true."""
+    ip = src.rsplit(":", 1)[0]  # haal poortnummer weg, houd IP over
     await _tg_broadcast(cfg.telegram.bot_token, cfg.telegram.allowed_chat_ids,
-                        f"🔔 Verbinding: <b>{backend.name}</b>  <code>{sni}</code>")
+                        f"🔔 <b>{backend.name}</b>  {ip}")
 
 
 async def _tg_cmd_cert(token: str, chat_id: int, cfg: "Config") -> None:
