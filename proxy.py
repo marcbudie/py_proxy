@@ -15,6 +15,7 @@ import asyncio
 import base64
 import fcntl
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -116,6 +117,7 @@ class EmailConfig:
 class TelegramConfig:
     bot_token: str = ""
     allowed_chat_ids: list = None   # type: ignore[assignment]
+    mini_app_url: str = ""
 
     def __post_init__(self):
         if self.allowed_chat_ids is None:
@@ -193,6 +195,7 @@ def load_config(path: Path) -> Config:
     telegram_cfg = TelegramConfig(
         bot_token=tc.get("bot_token", ""),
         allowed_chat_ids=tc.get("allowed_chat_ids", []),
+        mini_app_url=tc.get("mini_app_url", ""),
     )
 
     return Config(
@@ -241,6 +244,7 @@ def save_config(cfg: Config, path: Path) -> None:
         "telegram": {
             "bot_token": cfg.telegram.bot_token,
             "allowed_chat_ids": cfg.telegram.allowed_chat_ids,
+            "mini_app_url": cfg.telegram.mini_app_url,
         },
     }
     path.write_text(json.dumps(data, indent=2))
@@ -452,6 +456,23 @@ def _generate_otp() -> str:
     code = f"{secrets.randbelow(1_000_000):06d}"
     _otp_store[code] = (time.time() + OTP_TTL, False)
     return code
+
+
+def _validate_tg_init_data(init_data: str, bot_token: str) -> bool:
+    """Valideer Telegram WebApp initData via HMAC-SHA256."""
+    try:
+        params = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+        received_hash = params.pop("hash", None)
+        if not received_hash:
+            return False
+        if time.time() - int(params.get("auth_date", 0)) > 86400:
+            return False  # ouder dan 24 uur
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        computed = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(computed, received_hash)
+    except Exception:
+        return False
 
 
 def _verify_otp(code: str) -> bool:
@@ -1323,6 +1344,216 @@ function closeTerminal() {
 """
 
 
+MINI_APP_HTML = """\
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Proxy Beheer</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--tg-theme-bg-color, #fff);
+      color: var(--tg-theme-text-color, #000);
+      padding-bottom: 76px;
+    }
+    .topbar {
+      position: sticky; top: 0; z-index: 10;
+      background: var(--tg-theme-secondary-bg-color, #f4f4f4);
+      padding: 12px 16px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 1px solid rgba(128,128,128,.15);
+    }
+    .topbar-title { font-size: 17px; font-weight: 700; }
+    .topbar-meta { font-size: 12px; color: var(--tg-theme-hint-color, #8e8e93); text-align: right; }
+    .topbar-meta div + div { margin-top: 2px; }
+    .section { margin-top: 20px; }
+    .section-header {
+      font-size: 13px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase;
+      color: var(--tg-theme-hint-color, #8e8e93);
+      padding: 0 16px 8px;
+    }
+    .card-list { background: var(--tg-theme-secondary-bg-color, #f4f4f4); }
+    .route-row {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(128,128,128,.1);
+    }
+    .route-row:last-child { border-bottom: none; }
+    .route-icon {
+      width: 36px; height: 36px; border-radius: 9px; flex-shrink: 0;
+      background: var(--tg-theme-button-color, #2481cc);
+      display: flex; align-items: center; justify-content: center; font-size: 19px;
+    }
+    .route-info { flex: 1; min-width: 0; }
+    .route-name { font-size: 15px; font-weight: 500; }
+    .route-host {
+      font-size: 12px; color: var(--tg-theme-hint-color, #8e8e93);
+      margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .route-stats { font-size: 11px; margin-top: 3px; }
+    .ok  { color: #34c759; }
+    .rej { color: #ff3b30; }
+    .toggle { position: relative; width: 51px; height: 31px; flex-shrink: 0; }
+    .toggle input {
+      opacity: 0; position: absolute; inset: 0; width: 100%; height: 100%;
+      margin: 0; cursor: pointer; z-index: 1;
+    }
+    .t-track {
+      position: absolute; inset: 0; border-radius: 31px;
+      background: #e5e5ea; transition: background .2s;
+    }
+    .t-thumb {
+      position: absolute; top: 2px; left: 2px;
+      width: 27px; height: 27px; border-radius: 50%;
+      background: white; box-shadow: 0 2px 4px rgba(0,0,0,.3);
+      transition: transform .2s;
+    }
+    .toggle input:checked ~ .t-track { background: #34c759; }
+    .toggle input:checked ~ .t-thumb { transform: translateX(20px); }
+    .toggle input:disabled { cursor: not-allowed; }
+    .toggle input:disabled ~ .t-track { opacity: .5; }
+    .bottom-bar {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      padding: 10px 16px;
+      background: var(--tg-theme-bg-color, #fff);
+      border-top: 1px solid rgba(128,128,128,.15);
+    }
+    .btn {
+      width: 100%; padding: 14px;
+      background: var(--tg-theme-button-color, #2481cc);
+      color: var(--tg-theme-button-text-color, #fff);
+      border: none; border-radius: 12px;
+      font-size: 16px; font-weight: 600; cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn:active { opacity: .7; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .toast {
+      position: fixed; bottom: 76px; left: 50%;
+      transform: translateX(-50%) translateY(8px);
+      background: rgba(0,0,0,.75); color: white;
+      padding: 8px 18px; border-radius: 20px;
+      font-size: 14px; opacity: 0; pointer-events: none;
+      transition: opacity .2s, transform .2s; white-space: nowrap;
+    }
+    .toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .msg { padding: 40px 16px; text-align: center; color: var(--tg-theme-hint-color, #8e8e93); }
+    .err { color: #ff3b30; }
+  </style>
+</head>
+<body>
+<div class="topbar">
+  <div class="topbar-title">&#x1F5A5;&#xFE0F; Proxy</div>
+  <div class="topbar-meta">
+    <div id="uptime">&#x2014;</div>
+    <div id="active">&#x2014;</div>
+  </div>
+</div>
+<div id="main"><div class="msg">Laden&#x2026;</div></div>
+<div class="bottom-bar">
+  <button class="btn" id="btn-reload" onclick="reloadCfg()">&#x21BA; Config herladen</button>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const tg = window.Telegram.WebApp;
+tg.expand(); tg.ready();
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function fmtUp(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?h+'u '+m+'m':m+'m';}
+let _tt;
+function toast(msg){const e=document.getElementById('toast');e.textContent=msg;e.classList.add('on');clearTimeout(_tt);_tt=setTimeout(()=>e.classList.remove('on'),2200);}
+
+function icon(name){
+  const n=name.toLowerCase();
+  if(n.includes('ssh'))return'&#x1F510;';
+  if(n.includes('padel')||n.includes('court')||n.includes('free'))return'&#x1F3BE;';
+  if(n.includes('home')||n.includes('vm'))return'&#x1F3E0;';
+  if(n.includes('proxy')||n.includes('admin'))return'&#x2699;&#xFE0F;';
+  if(n.includes('cock')||n.includes('pf'))return'&#x1F527;';
+  return'&#x1F310;';
+}
+
+function card(r,type){
+  const id=type==='tls'?r.hostname:r.listen_port;
+  const sub=type==='tls'?r.hostname+' &rarr; '+r.host+':'+r.port
+                         +':'+r.listen_port+' &rarr; '+r.host+':'+r.port:'';
+  const label=type==='tls'?esc(r.hostname):':'+r.listen_port;
+  const ok=r.ok||0, rej=r.rejected||0;
+  const stats='<span class="ok">'+ok+' verbindingen</span>'+(rej?' &middot; <span class="rej">'+rej+' geweigerd</span>':'');
+  return '<div class="route-row">'
+    +'<div class="route-icon">'+icon(r.name)+'</div>'
+    +'<div class="route-info">'
+      +'<div class="route-name">'+esc(r.name)+'</div>'
+      +'<div class="route-host">'+label+'</div>'
+      +'<div class="route-stats">'+stats+'</div>'
+    +'</div>'
+    +'<label class="toggle">'
+      +'<input type="checkbox"'+(r.enabled?' checked':'')
+        +' data-type="'+type+'" data-id="'+esc(String(id))+'" onchange="tog(this)">'
+      +'<div class="t-track"></div><div class="t-thumb"></div>'
+    +'</label>'
+  +'</div>';
+}
+
+async function load(){
+  const r=await fetch('/api/overview');
+  if(r.status===401){document.getElementById('main').innerHTML='<div class="msg err">Niet ingelogd. Open via Telegram.</div>';return;}
+  if(!r.ok){toast('Laden mislukt');return;}
+  const d=await r.json();
+  document.getElementById('uptime').textContent=fmtUp(d.uptime_secs);
+  document.getElementById('active').textContent=d.active_tls+' TLS \u00b7 '+d.active_tcp+' TCP';
+  let html='';
+  if(d.tls_routes.length)html+='<div class="section"><div class="section-header">TLS routes</div><div class="card-list">'+d.tls_routes.map(r=>card(r,'tls')).join('')+'</div></div>';
+  if(d.tcp_routes.length)html+='<div class="section"><div class="section-header">TCP routes</div><div class="card-list">'+d.tcp_routes.map(r=>card(r,'tcp')).join('')+'</div></div>';
+  document.getElementById('main').innerHTML=html||'<div class="msg">Geen routes</div>';
+}
+
+async function tog(cb){
+  cb.disabled=true;
+  const url=cb.dataset.type==='tls'
+    ?'/api/routes/'+encodeURIComponent(cb.dataset.id)+'/toggle'
+    :'/api/tcp-routes/'+cb.dataset.id+'/toggle';
+  try{
+    const r=await fetch(url,{method:'POST'});
+    if(!r.ok)throw 0;
+    const d=await r.json();
+    cb.checked=d.enabled;
+    if(tg.HapticFeedback)tg.HapticFeedback.impactOccurred('light');
+    toast(d.enabled?'\\u2705 Ingeschakeld':'\\u274C Uitgeschakeld');
+  }catch{cb.checked=!cb.checked;toast('Toggle mislukt');}
+  cb.disabled=false;
+}
+
+async function reloadCfg(){
+  const b=document.getElementById('btn-reload');
+  b.disabled=true; b.textContent='Herladen\\u2026';
+  try{
+    const r=await fetch('/api/reload',{method:'POST'});
+    if(!r.ok)throw 0;
+    toast('\\u2705 Config herladen');
+    setTimeout(load,600);
+  }catch{toast('Herladen mislukt');}
+  b.disabled=false; b.textContent='\\u21BA Config herladen';
+}
+
+async function init(){
+  if(!tg.initData){await load();return;}
+  const r=await fetch('/api/tg-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:tg.initData})});
+  if(!r.ok){const e=await r.json().catch(()=>({}));document.getElementById('main').innerHTML='<div class="msg err">Authenticatie mislukt<br>'+esc(e.error||'')+'</div>';return;}
+  await load();
+}
+
+init();
+</script>
+</body>
+</html>
+"""
+
+
 # ── Admin web UI handler ──────────────────────────────────────────────────────
 
 def _parse_cookies(cookie_header: str) -> dict[str, str]:
@@ -1477,7 +1708,42 @@ async def handle_admin(
 
         # ── Auth endpoints (geen sessie vereist) ──────────────────────────────
 
-        if method == "GET" and path == "/favicon.svg":
+        if method == "GET" and path == "/app":
+            respond(200, "text/html; charset=utf-8", MINI_APP_HTML.encode("utf-8"))
+
+        elif method == "POST" and path == "/api/tg-auth":
+            try:
+                data = json.loads(body)
+                init_data = str(data.get("init_data", ""))
+            except Exception:
+                json_resp(400, {"error": "Ongeldige invoer."})
+            else:
+                bot_token = proxy_server.cfg.telegram.bot_token
+                if not bot_token:
+                    json_resp(500, {"error": "Telegram niet geconfigureerd."})
+                elif not _validate_tg_init_data(init_data, bot_token):
+                    json_resp(403, {"error": "Ongeldige of verlopen toegang."})
+                else:
+                    allowed = proxy_server.cfg.telegram.allowed_chat_ids
+                    authorized = True
+                    if allowed:
+                        try:
+                            params = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+                            user_id = json.loads(params.get("user", "{}")).get("id")
+                            authorized = user_id in allowed
+                        except Exception:
+                            authorized = False
+                    if not authorized:
+                        json_resp(403, {"error": "Niet toegestaan."})
+                    else:
+                        token = _create_session()
+                        cookie = (
+                            f"proxy_session={token}; Max-Age={SESSION_TTL}; "
+                            f"Path=/; HttpOnly; Secure; SameSite=Strict"
+                        )
+                        json_resp(200, {"ok": True}, [("Set-Cookie", cookie)])
+
+        elif method == "GET" and path == "/favicon.svg":
             respond(200, "image/svg+xml", LOGO_SVG.encode())
 
         elif method == "GET" and path == "/login":
@@ -1552,6 +1818,32 @@ async def handle_admin(
 
         elif not authed:
             json_resp(401, {"error": "Niet ingelogd."})
+
+        elif method == "GET" and path == "/api/overview":
+            uptime = int(time.time() - _stats["since"]) if _stats["since"] else 0
+            json_resp(200, {
+                "uptime_secs": uptime,
+                "active_tls":  _stats["active_tls"],
+                "active_tcp":  _stats["active_tcp"],
+                "tls_routes": [
+                    {"hostname": h, "host": b.host, "port": b.port, "name": b.name,
+                     "enabled": b.enabled,
+                     "ok":       _stats["tls_ok"].get(h, 0),
+                     "rejected": _stats["tls_rej"].get(h, 0)}
+                    for h, b in proxy_server.cfg.tls_routes.items()
+                ],
+                "tcp_routes": [
+                    {"listen_port": p, "host": b.host, "port": b.port, "name": b.name,
+                     "enabled": b.enabled,
+                     "ok":       _stats["tcp_ok"].get(b.name, 0),
+                     "rejected": _stats["tcp_rej"].get(b.name, 0)}
+                    for p, b in proxy_server.cfg.tcp_routes.items()
+                ],
+            })
+
+        elif method == "POST" and path == "/api/reload":
+            proxy_server.reload()
+            json_resp(200, {"ok": True})
 
         elif method == "GET" and path == "/api/routes":
             routes = [
@@ -1724,8 +2016,10 @@ def _tg_status_text(cfg: "Config") -> str:
 
 
 def _tg_toggle_keyboard(cfg: "Config") -> dict:
-    """Inline keyboard met één knop per route."""
+    """Inline keyboard met Mini App knop bovenaan en toggle-knoppen per route."""
     rows = []
+    if cfg.telegram.mini_app_url:
+        rows.append([{"text": "📱 Beheer openen", "web_app": {"url": cfg.telegram.mini_app_url}}])
     for hostname, be in cfg.tls_routes.items():
         icon = "✅" if be.enabled else "❌"
         rows.append([{"text": f"{icon} {be.name}", "callback_data": f"tls:{hostname}"[:64]}])
