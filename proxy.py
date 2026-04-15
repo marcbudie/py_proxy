@@ -2030,12 +2030,21 @@ def _tg_toggle_keyboard(cfg: "Config") -> dict:
 
 
 async def _tg_send_status(token: str, chat_id: int, cfg: "Config") -> None:
-    await asyncio.to_thread(_tg_call, token, "sendMessage", {
-        "chat_id": chat_id,
-        "text": _tg_status_text(cfg),
-        "parse_mode": "HTML",
-        "reply_markup": _tg_toggle_keyboard(cfg),
-    })
+    if cfg.telegram.mini_app_url:
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "📱 Open de beheer-app:",
+            "reply_markup": {"inline_keyboard": [[
+                {"text": "📱 Beheer openen", "web_app": {"url": cfg.telegram.mini_app_url}}
+            ]]},
+        })
+    else:
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": _tg_status_text(cfg),
+            "parse_mode": "HTML",
+            "reply_markup": _tg_toggle_keyboard(cfg),
+        })
 
 
 async def _tg_edit_status(token: str, chat_id: int, message_id: int, cfg: "Config") -> None:
@@ -2364,8 +2373,11 @@ class ProxyServer:
                     continue
 
                 # Dagelijkse statussamenvatting
-                await _tg_broadcast(token, self.cfg.telegram.allowed_chat_ids,
-                                    f"📊 <b>Dagelijkse samenvatting</b>\n\n{_tg_status_text(self.cfg)}")
+                for chat_id in self.cfg.telegram.allowed_chat_ids:
+                    try:
+                        await _tg_send_status(token, chat_id, self.cfg)
+                    except Exception as exc:
+                        logger.warning(f"Dagelijkse samenvatting naar {chat_id} mislukt: {exc}")
 
                 # Cert-vervaldatums controleren
                 now_utc = datetime.now(timezone.utc)
