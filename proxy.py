@@ -1531,6 +1531,12 @@ async function tog(cb){
   cb.disabled=false;
 }
 
+let _autoRefresh;
+function startAutoRefresh(){
+  clearInterval(_autoRefresh);
+  _autoRefresh=setInterval(load,10000);
+}
+
 async function refresh(){
   const b=document.getElementById('btn-refresh');
   b.disabled=true;
@@ -1551,10 +1557,11 @@ async function reloadCfg(){
 }
 
 async function init(){
-  if(!tg.initData){await load();return;}
+  if(!tg.initData){await load();startAutoRefresh();return;}
   const r=await fetch('/api/tg-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:tg.initData})});
   if(!r.ok){const e=await r.json().catch(()=>({}));document.getElementById('main').innerHTML='<div class="msg err">Authenticatie mislukt<br>'+esc(e.error||'')+'</div>';return;}
   await load();
+  startAutoRefresh();
 }
 
 init();
