@@ -5,9 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/admin/py_proxy
+User=pyproxy
+Group=pyproxy
+WorkingDirectory=/opt/py_proxy
 
-ExecStart=/usr/bin/python3 /home/admin/py_proxy/proxy.py /home/admin/py_proxy/config.json
+ExecStart=/usr/bin/python3 /opt/py_proxy/proxy.py /opt/py_proxy/config.json
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always

@@ -7,9 +7,9 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 - `proxy.py` — de volledige proxy, één bestand, geen externe dependencies
 - `config.json` — runtime configuratie (wordt live bijgehouden door de admin UI, **niet in git** vanwege Gmail app-wachtwoord)
 - `requirements.txt` — leeg (alles stdlib); aanwezig voor consistentie
-- `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen)
-- `proxy.service` — systemd service unit (draait als root met `/usr/bin/python3`)
-- `install.sh` — installeert en herstart de systemd service
+- `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen, vanuit de checkout)
+- `proxy.service` — systemd service unit (draait als `pyproxy` vanuit `/opt/py_proxy`)
+- `install.sh` — maakt systeemgebruiker aan, deployt naar `/opt/py_proxy`, installeert en start service
 - `backup.sh` — sync naar Google Drive via rclone (`google:backup/py_proxy`)
 
 ## Installeren en starten
@@ -17,10 +17,18 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 ### Via systemd (aanbevolen)
 
 ```bash
-sudo bash install.sh   # installeert en start systemd service
+sudo bash install.sh
 ```
 
-De service heet `py-proxy` en draait als root met `/usr/bin/python3`. Handige commando's:
+Dit doet:
+1. Systeemgebruiker `pyproxy` aanmaken (als die nog niet bestaat)
+2. `proxy.py` kopiëren naar `/opt/py_proxy/`
+3. `config.json` kopiëren naar `/opt/py_proxy/` (alleen als die er nog niet staat)
+4. Eigenaar instellen op `pyproxy`, SELinux context herstellen via `restorecon`
+5. Controleren of cert-bestanden leesbaar zijn voor `pyproxy`
+6. Systemd service installeren en starten
+
+De service heet `py-proxy` en draait als `pyproxy` vanuit `/opt/py_proxy`. Handige commando's:
 
 ```bash
 systemctl status  py-proxy        # status bekijken
@@ -29,10 +37,29 @@ systemctl reload  py-proxy        # config herladen (SIGHUP)
 systemctl restart py-proxy        # herstarten na nieuwe versie
 ```
 
-Na een wijziging van `proxy.py` is alleen `systemctl restart py-proxy` nodig.  
-`sudo bash install.sh` opnieuw uitvoeren is alleen nodig bij een verse checkout.
+Na een update van `proxy.py`: `sudo bash install.sh` opnieuw uitvoeren (kopieert de nieuwe versie en herstart).
+
+#### Cert-bestanden toegankelijk maken voor pyproxy
+
+De certs staan in `/home/admin/ssl/` en zijn standaard niet leesbaar voor `pyproxy`. Fix per bestand:
+
+```bash
+setfacl -m u:pyproxy:r /home/admin/ssl/ClouDNS/MarcBudie.crt
+setfacl -m u:pyproxy:r /home/admin/ssl/ClouDNS/MarcBudie.key
+setfacl -m u:pyproxy:r /home/admin/ssl/freecourts/fullchain_padel.freecourts.nl.crt
+setfacl -m u:pyproxy:r /home/admin/ssl/freecourts/padel.freecourts.nl.key
+# Traverse-rechten op de parent-directories
+setfacl -m u:pyproxy:x /home/admin/ssl/ClouDNS
+setfacl -m u:pyproxy:x /home/admin/ssl/freecourts
+setfacl -m u:pyproxy:x /home/admin/ssl
+setfacl -m u:pyproxy:x /home/admin
+```
+
+`install.sh` waarschuwt automatisch welke bestanden niet leesbaar zijn.
 
 ### Direct (ontwikkeling)
+
+Vanuit de checkout in `/home/admin/py_proxy` — gebruikt de lokale `config.json`:
 
 ```bash
 bash run.sh                        # met /usr/bin/python3
@@ -213,14 +240,15 @@ Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 
 ## Veiligheid
 
-- **Root uitvoering** — de service draait als root. Nette oplossing: bestanden naar `/opt/py_proxy` verplaatsen en een dedicated systeemgebruiker aanmaken, dan vervalt ook het SELinux-probleem. Zolang de proxy in `/home/admin` staat is root de enige werkende optie op SELinux-systemen.
+- **Dedicated systeemgebruiker** — de service draait als `pyproxy` (geen login shell, geen home dir) vanuit `/opt/py_proxy`. Dit beperkt de blast radius bij een eventuele kwetsbaarheid.
 - **config.json** — bevat Gmail app-wachtwoord en Telegram bot-token. Nooit in git committen. Alleen leesbaar als root (acceptabel).
 - **Telegram bot** — bot-commando's werken via outbound long-polling; de `proxy.budie.eu` TLS route hoeft **niet** actief te zijn. De Mini App (`/app`) vereist de route **wel** — die wordt geserveerd via de admin UI op poort 9443.
 - **FreeCourts firewall-regel** (8444→8443) — omzeilt de proxy volledig. Nu disabled; niet inschakelen tenzij bewust gewenst.
 
 ## Bekende valkuilen
 
-- De service draait als root met `/usr/bin/python3` — geen venv. Op SELinux-systemen (RHEL/AlmaLinux) blokkeert SELinux het uitvoeren van binaries met `user_home_t` context vanuit systemd (`init_t`). Gebruik daarom altijd de systeem-python3 in de service.
+- De service draait als `pyproxy` vanuit `/opt/py_proxy`. Op SELinux-systemen (RHEL/AlmaLinux) blokkeert SELinux het uitvoeren van bestanden met `user_home_t` context vanuit systemd. Door te deployen naar `/opt` krijgen bestanden `usr_t` context na `restorecon` — dit werkt wel.
+- Cert-bestanden in `/home/admin/ssl/` zijn standaard niet leesbaar voor `pyproxy` — zie de `setfacl`-commando's in de installatiesectie.
 - Admin poort is 9443 — HTTPS verplicht, proxy weigert te starten zonder geldig `tls_cert`/`tls_key`.
 - `config.json` staat niet in git vanwege het Gmail app-wachtwoord en Telegram bot-token — na een verse checkout handmatig aanmaken.
 - De admin UI gebruikt `Connection: keep-alive` met een `while True` loop zodat de TLS-verbinding open blijft na een response. Zonder keep-alive stuurt asyncio's SSL-transport een TCP RST als de browser's `close_notify` nog in de buffer zit.
