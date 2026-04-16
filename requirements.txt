@@ -1,2 +1,1 @@
-# py_proxy heeft geen externe Python-dependencies.
-# Alle imports zijn stdlib. Dit bestand is aanwezig voor consistentie.
+segno>=1.6.6   # QR-code generatie (TOTP setup pagina) — pure Python, geen Pillow nodig

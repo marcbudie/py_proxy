@@ -4,9 +4,9 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 
 ## Bestanden
 
-- `proxy.py` — de volledige proxy, één bestand, geen externe dependencies
+- `proxy.py` — de volledige proxy, één bestand
 - `config.json` — runtime configuratie (wordt live bijgehouden door de admin UI, **niet in git** vanwege Gmail app-wachtwoord)
-- `requirements.txt` — leeg (alles stdlib); aanwezig voor consistentie
+- `requirements.txt` — één externe dependency: `segno` (QR-code generatie voor TOTP setup pagina)
 - `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen, vanuit de checkout)
 - `proxy.service` — systemd service unit (draait als `pyproxy` vanuit `/opt/py_proxy`)
 - `install.sh` — maakt systeemgebruiker aan, deployt naar `/opt/py_proxy`, installeert en start service
@@ -22,11 +22,12 @@ sudo bash install.sh
 
 Dit doet:
 1. Systeemgebruiker `pyproxy` aanmaken (als die nog niet bestaat)
-2. `proxy.py` kopiëren naar `/opt/py_proxy/`
-3. `config.json` kopiëren naar `/opt/py_proxy/` (alleen als die er nog niet staat)
-4. Eigenaar instellen op `pyproxy`, SELinux context herstellen via `restorecon`
-5. Controleren of cert-bestanden leesbaar zijn voor `pyproxy`
-6. Systemd service installeren en starten
+2. Python-dependencies installeren via `pip3 install --break-system-packages -r requirements.txt` (momenteel: `segno`)
+3. `proxy.py` kopiëren naar `/opt/py_proxy/`
+4. `config.json` kopiëren naar `/opt/py_proxy/` (alleen als die er nog niet staat)
+5. Eigenaar instellen op `pyproxy`, SELinux context herstellen via `restorecon`
+6. Controleren of cert-bestanden leesbaar zijn voor `pyproxy`
+7. Systemd service installeren en starten
 
 De service heet `py-proxy` en draait als `pyproxy` vanuit `/opt/py_proxy`. Handige commando's:
 

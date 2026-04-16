@@ -39,6 +39,12 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
+import io
+try:
+    import segno
+    _SEGNO_OK = True
+except ImportError:
+    _SEGNO_OK = False
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -500,7 +506,7 @@ def _verify_otp(code: str) -> bool:
 
 # ── TOTP (RFC 6238) ───────────────────────────────────────────────────────────
 
-_totp_used_steps: set[int] = set()   # replay-bescherming: gebruikte time-steps
+_totp_used_steps: dict[int, float] = {}   # replay-bescherming: step → first-use timestamp
 
 
 def _totp_code(secret_b32: str, step: int) -> str:
@@ -513,16 +519,32 @@ def _totp_code(secret_b32: str, step: int) -> str:
     return f"{code % 1_000_000:06d}"
 
 
+_TOTP_GRACE = 5.0   # seconden: sta tweede identieke POST toe (browser double-submit)
+
+
 def _totp_verify(code: str, secret_b32: str, window: int = 1) -> bool:
     """Verifieer een TOTP-code; sta ±window tijdstappen toe voor klokafwijking.
-    Markeert de gebruikte stap om replay-aanvallen te voorkomen."""
-    step = int(time.time() // 30)
+    Markeert de gebruikte stap om replay-aanvallen te voorkomen.
+    Binnen _TOTP_GRACE seconden na first-use wordt dezelfde stap nogmaals geaccepteerd
+    (browsers sturen de POST soms twee keer op aparte TCP-verbindingen)."""
+    now = time.time()
+    step = int(now // 30)
     for delta in range(-window, window + 1):
         s = step + delta
-        if s not in _totp_used_steps and hmac.compare_digest(_totp_code(secret_b32, s), code):
-            _totp_used_steps.add(s)
-            _totp_used_steps.discard(s - 10)   # opruimen van oude stappen
-            return True
+        if hmac.compare_digest(_totp_code(secret_b32, s), code):
+            first_use = _totp_used_steps.get(s)
+            if first_use is None:
+                # Eerste gebruik — markeer en accepteer
+                _totp_used_steps[s] = now
+                # Opruimen van oude stappen (ouder dan window + extra marge)
+                cutoff = step - window - 10
+                for old in [k for k in _totp_used_steps if k < cutoff]:
+                    del _totp_used_steps[old]
+                return True
+            if now - first_use <= _TOTP_GRACE:
+                # Tweede verzoek binnen genade-periode — browser double-submit
+                return True
+            # Stap al gebruikt buiten genade-periode: replay-aanval
     return False
 
 
@@ -537,6 +559,18 @@ def _totp_uri(secret: str, issuer: str = "SNI Proxy", account: str = "admin") ->
     account_enc = urllib.parse.quote(account)
     return (f"otpauth://totp/{issuer_enc}:{account_enc}"
             f"?secret={secret}&issuer={issuer_enc}&algorithm=SHA1&digits=6&period=30")
+
+
+def _totp_qr_svg(uri: str) -> Optional[str]:
+    """Genereer QR-code als SVG data-URI. Geeft None als segno niet beschikbaar is."""
+    if not _SEGNO_OK:
+        return None
+    buf = io.BytesIO()
+    segno.make(uri, error="M").save(buf, kind="svg", svgclass=None, lineclass=None,
+                                    omitsize=True, xmldecl=False, nl=False)
+    svg = buf.getvalue()
+    encoded = base64.b64encode(svg).decode()
+    return f"data:image/svg+xml;base64,{encoded}"
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────
@@ -884,11 +918,18 @@ def _make_login_html(totp_enabled: bool) -> str:
 """
 
     totp_script = """
+let _totpBusy = false;
 async function verifyTotp() {
+  if (_totpBusy) return;
+  _totpBusy = true;
   const code = document.getElementById('totpInput').value.trim();
-  if (code.length !== 6) { setMsg('msgTotp', 'Voer een 6-cijferige code in.', false); return; }
   const btn = document.getElementById('btnTotp');
   btn.disabled = true; btn.textContent = 'Controleren\u2026';
+  if (code.length !== 6) {
+    setMsg('msgTotp', 'Voer een 6-cijferige code in.', false);
+    btn.disabled = false; btn.textContent = 'Inloggen';
+    _totpBusy = false; return;
+  }
   try {
     const r = await fetch('/api/auth/verify-totp', {
       method: 'POST',
@@ -896,13 +937,16 @@ async function verifyTotp() {
       body: JSON.stringify({code}),
     });
     const d = await r.json();
-    if (!r.ok) { setMsg('msgTotp', d.error || 'Ongeldige code.', false); return; }
-    window.location.href = '/';
+    if (r.ok) { window.location.replace('/'); return; }
+    setMsg('msgTotp', d.error || 'Ongeldige code.', false);
   } catch (e) {
-    setMsg('msgTotp', 'Netwerkfout: ' + e, false);
-  } finally {
-    btn.disabled = false; btn.textContent = 'Inloggen';
+    // Verbinding verbroken — de server heeft de login mogelijk al verwerkt.
+    // Navigeer naar / : als de cookie gezet was → dashboard, anders → terug naar /login.
+    window.location.replace('/');
+    return;
   }
+  _totpBusy = false;
+  btn.disabled = false; btn.textContent = 'Inloggen';
 }
 """ if totp_enabled else """
 function show(id) {
@@ -1056,6 +1100,8 @@ TOTP_SETUP_HTML = """\
   .msg-err { background: #fde8e8; color: #991b1b; display: block; }
   .warn { background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px;
           padding: .6rem .9rem; font-size: .83rem; color: #9a3412; margin-bottom: 1rem; }
+  .qr-wrap { display: flex; justify-content: center; margin: .75rem 0 .5rem; }
+  .qr-wrap canvas, .qr-wrap img { border-radius: 8px; border: 1px solid #e5e7eb; display: block; }
 </style>
 </head>
 <body>
@@ -1069,12 +1115,15 @@ TOTP_SETUP_HTML = """\
       zonder back-up, ben je buitengesloten.
     </div>
 
-    <h2>Stap 1 — Voeg toe aan je authenticator-app</h2>
+    <h2>Stap 1 — Scan de QR-code</h2>
     <ol>
       <li>Open Google Authenticator, Authy of Bitwarden</li>
-      <li>Kies "Account toevoegen" → "Sleutel handmatig invoeren"</li>
-      <li>Kopieer het geheim hieronder en plak het in de app</li>
+      <li>Kies "Account toevoegen" → "QR-code scannen"</li>
+      <li>Scan de code hieronder — of voer het geheim handmatig in</li>
     </ol>
+    <div class="qr-wrap" id="qrWrap" style="display:none">
+      <img id="qrImg" alt="QR-code" width="200" height="200">
+    </div>
 
     <div class="secret-box">
       <span class="secret-text" id="secretText">Laden…</span>
@@ -1116,6 +1165,10 @@ async function load() {
     document.getElementById('secretText').textContent =
       _secret.match(/.{1,4}/g).join(' ');
     document.getElementById('uriBox').textContent = _uri;
+    if (d.qr_svg) {
+      document.getElementById('qrImg').src = d.qr_svg;
+      document.getElementById('qrWrap').style.display = 'flex';
+    }
   } catch(e) {
     document.getElementById('secretText').textContent = 'Fout: ' + e;
   }
@@ -1940,6 +1993,7 @@ async def handle_admin(
         session_token = cookies.get("proxy_session")
         authed = _check_session(session_token)
 
+
         # ── WebSocket upgrade voor terminal ───────────────────────────────────
         if (headers_raw.get('upgrade', '').lower() == 'websocket'
                 and path == '/term_sock'):
@@ -2101,16 +2155,13 @@ async def handle_admin(
                 else:
                     if not code.isdigit() or len(code) != 6:
                         json_resp(400, {"error": "Code moet 6 cijfers zijn."})
-                    elif _totp_verify(code, proxy_server.cfg.totp_secret):
+                    elif _totp_verify(code, proxy_server.cfg.totp_secret, window=2):
                         token = _create_session()
                         cookie = (
                             f"proxy_session={token}; Max-Age={SESSION_TTL}; "
                             f"Path=/; HttpOnly; Secure; SameSite=Strict"
                         )
                         logger.info("Succesvolle inlog via TOTP")
-                        asyncio.ensure_future(
-                            _tg_send_message("🔐 Admin ingelogd via TOTP", proxy_server.cfg)
-                        )
                         json_resp(200, {"ok": True}, [("Set-Cookie", cookie)])
                     else:
                         json_resp(401, {"error": "Ongeldige of al gebruikte code."})
@@ -2134,10 +2185,12 @@ async def handle_admin(
                 json_resp(401, {"error": "Niet ingelogd."})
             else:
                 new_secret = _totp_new_secret()
-                json_resp(200, {
-                    "secret": new_secret,
-                    "uri":    _totp_uri(new_secret),
-                })
+                uri = _totp_uri(new_secret)
+                resp = {"secret": new_secret, "uri": uri}
+                qr = _totp_qr_svg(uri)
+                if qr:
+                    resp["qr_svg"] = qr
+                json_resp(200, resp)
 
         elif method == "POST" and path == "/api/totp/enable":
             if not authed:
@@ -2297,10 +2350,14 @@ async def handle_admin(
         else:
             respond(404, "text/plain", b"Not found")
 
-        await writer.drain()
+        try:
+            await writer.drain()
+        except Exception as drain_exc:
+            logger.warning(f"Admin drain fout [{method} {path}]: {drain_exc}")
+            break
 
     except Exception as exc:
-        logger.debug(f"Admin handler error: {exc}")
+        logger.warning(f"Admin handler error: {exc}")
     finally:
         try:
             writer.close()
@@ -2403,21 +2460,12 @@ def _tg_toggle_keyboard(cfg: "Config") -> dict:
 
 
 async def _tg_send_status(token: str, chat_id: int, cfg: "Config") -> None:
-    if cfg.telegram.mini_app_url:
-        await asyncio.to_thread(_tg_call, token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "📱 Open de beheer-app:",
-            "reply_markup": {"inline_keyboard": [[
-                {"text": "📱 Beheer openen", "web_app": {"url": cfg.telegram.mini_app_url}}
-            ]]},
-        })
-    else:
-        await asyncio.to_thread(_tg_call, token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": _tg_status_text(cfg),
-            "parse_mode": "HTML",
-            "reply_markup": _tg_toggle_keyboard(cfg),
-        })
+    await asyncio.to_thread(_tg_call, token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": _tg_status_text(cfg),
+        "parse_mode": "HTML",
+        "reply_markup": _tg_toggle_keyboard(cfg),
+    })
 
 
 async def _tg_edit_status(token: str, chat_id: int, message_id: int, cfg: "Config") -> None:
