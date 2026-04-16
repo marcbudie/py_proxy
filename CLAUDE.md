@@ -52,6 +52,14 @@ De subdirectories (`ssl/`, `ssl/ClouDNS/`, `ssl/freecourts/`) zijn `drwxr-xr-x` 
 
 `install.sh` controleert daarna of alle cert-bestanden leesbaar zijn en waarschuwt bij problemen.
 
+#### Sudoers-regel voor Telegram /restart
+
+De Telegram bot kan de service herstarten via `sudo systemctl restart py-proxy`. `install.sh` maakt hiervoor automatisch `/etc/sudoers.d/pyproxy-restart` aan:
+
+```
+pyproxy ALL=(root) NOPASSWD: /usr/bin/systemctl restart py-proxy
+```
+
 ### Direct (ontwikkeling)
 
 Vanuit de checkout in `/home/admin/py_proxy` — gebruikt de lokale `config.json`:
@@ -232,6 +240,7 @@ Na het invullen: `systemctl reload py-proxy` (geen herstart nodig). Als het toke
 | `/cert`      | Vervaldatums van alle geconfigureerde certificaten (🟢/🟡/🔴) |
 | `/logs`      | Laatste 30 logregels uit journald |
 | `/reload`    | Config herladen zonder herstart (zelfde als `systemctl reload`) |
+| `/restart`   | Service herstarten (`systemctl restart py-proxy`) |
 | `/clear`     | Verbindingstellers resetten (runtime statistieken, gereset bij herstart) |
 | `/proxyaan`  | Route `proxy.budie.eu` inschakelen — bruikbaar als de TLS route uit staat en de admin UI onbereikbaar is |
 | `/proxyuit`  | Route `proxy.budie.eu` uitschakelen |

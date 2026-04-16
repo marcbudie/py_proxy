@@ -2621,7 +2621,8 @@ async def _tg_send_otp(code: str, cfg: "Config") -> None:
 
 
 async def _tg_handle_message(
-    message: dict, token: str, allowed_ids: list, proxy: "ProxyServer"
+    message: dict, token: str, allowed_ids: list, proxy: "ProxyServer",
+    update_id: int = None,
 ) -> None:
     chat_id = message["chat"]["id"]
     if allowed_ids and chat_id not in allowed_ids:
@@ -2647,8 +2648,9 @@ async def _tg_handle_message(
                 "/status — routes, statistieken en toggle-knoppen\n"
                 "/cert   — vervaldatums van alle certificaten\n"
                 "/logs   — laatste 30 logregels\n"
-                "/reload — config herladen (zonder herstart)\n"
-                "/clear  — verbindingstellers resetten\n"
+                "/reload  — config herladen (zonder herstart)\n"
+                "/restart — service herstarten\n"
+                "/clear   — verbindingstellers resetten\n"
                 "/proxyaan — proxy.budie.eu inschakelen\n"
                 "/proxyuit — proxy.budie.eu uitschakelen\n"
                 "/help   — dit bericht"
@@ -2664,6 +2666,25 @@ async def _tg_handle_message(
         await asyncio.to_thread(_tg_call, token, "sendMessage", {
             "chat_id": chat_id, "text": "✅ Config herladen.",
         })
+    elif command == "/restart":
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id, "text": "🔄 Service herstarten…",
+        })
+        # Bevestig deze update bij Telegram zodat de nieuwe instantie hem niet opnieuw verwerkt
+        if update_id is not None:
+            try:
+                await asyncio.to_thread(
+                    _tg_call, token, "getUpdates", {"offset": update_id + 1, "timeout": 0}, 5
+                )
+            except Exception:
+                pass
+        logger.info("Telegram: service herstart via /restart")
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "systemctl", "restart", "py-proxy",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
     elif command == "/clear":
         _stats["tls_ok"].clear()
         _stats["tls_rej"].clear()
@@ -2838,12 +2859,17 @@ class ProxyServer:
             addrs = [str(s.getsockname()) for s in srv.sockets or []]
             logger.info(f"Proxy listening on {', '.join(addrs)}")
 
-        for listen_port, backend in self.cfg.tcp_routes.items():
-            def tcp_handler(r, w, b=backend):
-                return asyncio.create_task(handle_tcp_connection(r, w, b, self.cfg))
+        for listen_port in list(self.cfg.tcp_routes):
+            def tcp_handler(r, w, port=listen_port):
+                backend = self.cfg.tcp_routes.get(port)
+                if backend is None:
+                    w.close()
+                    return asyncio.create_task(asyncio.sleep(0))
+                return asyncio.create_task(handle_tcp_connection(r, w, backend, self.cfg))
             srv = await asyncio.start_server(tcp_handler, self.cfg.listen_host, listen_port)
             self._servers.append(srv)
-            logger.info(f"TCP route :{listen_port} → {backend.name} ({backend.host}:{backend.port})")
+            be = self.cfg.tcp_routes[listen_port]
+            logger.info(f"TCP route :{listen_port} → {be.name} ({be.host}:{be.port})")
 
         admin_ssl = self._make_admin_ssl_ctx()
         if not admin_ssl:
@@ -2952,7 +2978,7 @@ class ProxyServer:
                     try:
                         if "message" in update or "edited_message" in update:
                             msg = update.get("message") or update["edited_message"]
-                            await _tg_handle_message(msg, token, allowed, self)
+                            await _tg_handle_message(msg, token, allowed, self, update["update_id"])
                         elif "callback_query" in update:
                             await _tg_handle_callback(update["callback_query"], token, allowed, self)
                     except Exception as exc:

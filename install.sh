@@ -87,13 +87,25 @@ done
 $CERT_OK && echo "  Alle cert-bestanden zijn leesbaar."
 
 echo ""
-echo "=== [4/5] Systemd service installeren ==="
+echo "=== [4/5] Sudoers-regel instellen voor /restart ==="
+SUDOERS_FILE="/etc/sudoers.d/pyproxy-restart"
+SUDOERS_LINE="pyproxy ALL=(root) NOPASSWD: /usr/bin/systemctl restart py-proxy"
+if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -qF "$SUDOERS_LINE" "$SUDOERS_FILE"; then
+    echo "$SUDOERS_LINE" > "$SUDOERS_FILE"
+    chmod 440 "$SUDOERS_FILE"
+    echo "Sudoers-regel aangemaakt: $SUDOERS_FILE"
+else
+    echo "Sudoers-regel al aanwezig."
+fi
+
+echo ""
+echo "=== [5/6] Systemd service installeren ==="
 cp "$SCRIPT_DIR/proxy.service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 chmod 644 "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 systemctl daemon-reload
 
 echo ""
-echo "=== [5/5] Service activeren en (her)starten ==="
+echo "=== [6/6] Service activeren en (her)starten ==="
 systemctl enable "${SERVICE_NAME}.service"
 systemctl restart "${SERVICE_NAME}.service"
 
