@@ -1460,19 +1460,16 @@ async function loadTotpStatus() {
     const d = await r.json();
     const el = document.getElementById('totpStatus');
     if (!el) return;
+    const btnStyle = 'border:1px solid #d1d5db;background:#f9fafb;border-radius:6px;padding:.25rem .7rem;font-size:.8rem;cursor:pointer;';
+    const btnDanger = 'border:1px solid #fca5a5;background:#fef2f2;border-radius:6px;padding:.25rem .7rem;font-size:.8rem;cursor:pointer;color:#b91c1c;';
+    const btnPrimary = 'border:none;background:#6366f1;color:#fff;border-radius:6px;padding:.3rem .8rem;font-size:.8rem;cursor:pointer;';
     if (d.enabled) {
-      el.innerHTML = '<span style="color:#166534;font-weight:600">✓ Actief</span>'
-        + ' &nbsp;<button onclick="window.location.href=\'/totp-setup\'" style="'
-        + 'border:1px solid #d1d5db;background:#f9fafb;border-radius:6px;padding:.25rem .7rem;'
-        + 'font-size:.8rem;cursor:pointer;">Vervangen</button>'
-        + ' <button onclick="disableTotp()" style="border:1px solid #fca5a5;background:#fef2f2;'
-        + 'border-radius:6px;padding:.25rem .7rem;font-size:.8rem;cursor:pointer;color:#b91c1c;">'
-        + 'Uitschakelen</button>';
+      el.innerHTML = `<span style="color:#166534;font-weight:600">&#10003; Actief</span>
+        &nbsp;<button style="${btnStyle}" onclick="window.location.href='/totp-setup'">Vervangen</button>
+        <button style="${btnDanger}" onclick="disableTotp()">Uitschakelen</button>`;
     } else {
-      el.innerHTML = '<span style="color:#9ca3af">Niet actief (e-mail/Telegram OTP)</span>'
-        + ' &nbsp;<button onclick="window.location.href=\'/totp-setup\'" style="'
-        + 'border:none;background:#6366f1;color:#fff;border-radius:6px;padding:.3rem .8rem;'
-        + 'font-size:.8rem;cursor:pointer;">Instellen</button>';
+      el.innerHTML = `<span style="color:#9ca3af">Niet actief (e-mail/Telegram OTP)</span>
+        &nbsp;<button style="${btnPrimary}" onclick="window.location.href='/totp-setup'">Instellen</button>`;
     }
   } catch(e) {}
 }
