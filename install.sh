@@ -25,7 +25,15 @@ else
 fi
 
 echo ""
-echo "=== [2/4] Bestanden deployen naar $DEPLOY_DIR ==="
+echo "=== [2/4] Python-dependencies installeren ==="
+if [[ -f "$SCRIPT_DIR/requirements.txt" ]]; then
+    pip3 install --quiet --break-system-packages -r "$SCRIPT_DIR/requirements.txt" \
+        && echo "Dependencies geïnstalleerd." \
+        || echo "WAARSCHUWING: pip install mislukt — segno (QR-code) mogelijk niet beschikbaar."
+fi
+
+echo ""
+echo "=== [3/5] Bestanden deployen naar $DEPLOY_DIR ==="
 mkdir -p "$DEPLOY_DIR"
 cp "$SCRIPT_DIR/proxy.py" "$DEPLOY_DIR/proxy.py"
 
@@ -79,13 +87,13 @@ done
 $CERT_OK && echo "  Alle cert-bestanden zijn leesbaar."
 
 echo ""
-echo "=== [3/4] Systemd service installeren ==="
+echo "=== [4/5] Systemd service installeren ==="
 cp "$SCRIPT_DIR/proxy.service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 chmod 644 "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 systemctl daemon-reload
 
 echo ""
-echo "=== [4/4] Service activeren en (her)starten ==="
+echo "=== [5/5] Service activeren en (her)starten ==="
 systemctl enable "${SERVICE_NAME}.service"
 systemctl restart "${SERVICE_NAME}.service"
 
