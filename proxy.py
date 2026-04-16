@@ -1262,6 +1262,16 @@ ADMIN_HTML = """\
   tr:first-child td { border-top: none; }
   .host { font-family: monospace; font-size: .88rem; }
   .backend { color: #777; font-size: .82rem; font-family: monospace; }
+  .route-stats { font-size: .76rem; margin-top: .15rem; color: #aaa; }
+  .s-ok  { color: #16a34a; }
+  .s-rej { color: #dc2626; }
+  .auth-card { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+  .auth-label { font-size: .85rem; font-weight: 600; color: #444; white-space: nowrap; }
+  .auth-status { font-size: .85rem; color: #9ca3af; display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+  .btn-auth { border: 1px solid #d1d5db; background: #f9fafb; border-radius: 6px;
+              padding: .25rem .7rem; font-size: .8rem; cursor: pointer; }
+  .btn-auth-danger { border-color: #fca5a5; background: #fef2f2; color: #b91c1c; }
+  .btn-auth-primary { border: none; background: #6366f1; color: #fff; padding: .3rem .8rem; }
   .badge { display: inline-block; padding: .2rem .65rem; border-radius: 20px; font-size: .78rem; font-weight: 600; }
   .badge-on  { background: #dcf5e7; color: #1a7a40; }
   .badge-off { background: #fde8e8; color: #b91c1c; }
@@ -1290,6 +1300,11 @@ ADMIN_HTML = """\
          font-size: .88rem; display: none; }
   .msg-ok  { background: #dcf5e7; color: #166534; }
   .msg-err { background: #fde8e8; color: #991b1b; }
+  .kpi-row { display: flex; gap: .75rem; max-width: 800px; margin-bottom: 1.5rem; flex-wrap: wrap; }
+  .kpi { background: #fff; border-radius: 10px; box-shadow: 0 1px 6px rgba(0,0,0,.1);
+         padding: .75rem 1.25rem; flex: 1; min-width: 110px; }
+  .kpi-label { font-size: .72rem; color: #888; text-transform: uppercase; letter-spacing: .05em; margin-bottom: .3rem; }
+  .kpi-value { font-size: 1.6rem; font-weight: 700; color: #111; line-height: 1; }
   @media (max-width: 640px) {
     body { padding: 1rem; }
     h1 { font-size: 1.2rem; }
@@ -1305,6 +1320,8 @@ ADMIN_HTML = """\
     .add-card { padding: 1rem; }
     .fields { grid-template-columns: 1fr; }
     .btn-add { width: 100%; }
+    .kpi-row { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+    .kpi { min-width: unset; padding: .6rem 1rem; }
   }
 </style>
 </head>
@@ -1328,11 +1345,19 @@ ADMIN_HTML = """\
   </div>
   <div id="term-container"></div>
 </div>
+<div class="kpi-row">
+  <div class="kpi"><div class="kpi-label">Actief TLS</div><div class="kpi-value" id="k-tls">—</div></div>
+  <div class="kpi"><div class="kpi-label">Actief TCP</div><div class="kpi-value" id="k-tcp">—</div></div>
+  <div class="kpi"><div class="kpi-label">Verbindingen</div><div class="kpi-value" id="k-total">—</div></div>
+  <div class="kpi"><div class="kpi-label">Onbekende SNI</div><div class="kpi-value" id="k-unknown">—</div></div>
+  <div class="kpi"><div class="kpi-label">Uptime</div><div class="kpi-value" id="k-uptime">—</div></div>
+</div>
+
 <table>
   <thead>
     <tr>
       <th>Hostname</th>
-      <th>Backend</th>
+      <th>Naam</th>
       <th>Status</th>
       <th>Aan / Uit</th>
       <th></th>
@@ -1348,7 +1373,7 @@ ADMIN_HTML = """\
   <thead>
     <tr>
       <th>Luisterpoort</th>
-      <th>Backend</th>
+      <th>Naam</th>
       <th>Status</th>
       <th>Aan / Uit</th>
     </tr>
@@ -1358,10 +1383,10 @@ ADMIN_HTML = """\
   </tbody>
 </table>
 
-<div class="add-card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
-  <div style="display:flex;align-items:center;gap:.75rem">
-    <span style="font-size:.85rem;font-weight:600;color:#444">🔐 Authenticatie:</span>
-    <span id="totpStatus" style="font-size:.85rem;color:#9ca3af">Laden&hellip;</span>
+<div class="add-card">
+  <div class="auth-card">
+    <span class="auth-label">🔐 Authenticatie:</span>
+    <span id="totpStatus" class="auth-status">Laden&hellip;</span>
   </div>
 </div>
 
@@ -1387,7 +1412,12 @@ async function load() {
     document.getElementById('tbody').innerHTML = routes.length ? routes.map(rt => `
       <tr>
         <td class="host">${esc(rt.hostname)}</td>
-        <td class="backend">${esc(rt.name)} &rarr; ${esc(rt.host)}:${rt.port}</td>
+        <td class="backend">
+          ${esc(rt.name)}
+          <div class="route-stats">
+            <span class="s-ok">${rt.ok} verbindingen</span>${rt.rejected ? ` &middot; <span class="s-rej">${rt.rejected} geweigerd</span>` : ''}
+          </div>
+        </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
@@ -1465,7 +1495,12 @@ async function loadTcp() {
     document.getElementById('tcp-tbody').innerHTML = routes.length ? routes.map(rt => `
       <tr>
         <td class="host">:${rt.listen_port}</td>
-        <td class="backend">${esc(rt.name)} &rarr; ${esc(rt.host)}:${rt.port}</td>
+        <td class="backend">
+          ${esc(rt.name)}
+          <div class="route-stats">
+            <span class="s-ok">${rt.ok} verbindingen</span>${rt.rejected ? ` &middot; <span class="s-rej">${rt.rejected} geweigerd</span>` : ''}
+          </div>
+        </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
@@ -1513,16 +1548,13 @@ async function loadTotpStatus() {
     const d = await r.json();
     const el = document.getElementById('totpStatus');
     if (!el) return;
-    const btnStyle = 'border:1px solid #d1d5db;background:#f9fafb;border-radius:6px;padding:.25rem .7rem;font-size:.8rem;cursor:pointer;';
-    const btnDanger = 'border:1px solid #fca5a5;background:#fef2f2;border-radius:6px;padding:.25rem .7rem;font-size:.8rem;cursor:pointer;color:#b91c1c;';
-    const btnPrimary = 'border:none;background:#6366f1;color:#fff;border-radius:6px;padding:.3rem .8rem;font-size:.8rem;cursor:pointer;';
     if (d.enabled) {
-      el.innerHTML = `<span style="color:#166534;font-weight:600">&#10003; Actief</span>
-        &nbsp;<button style="${btnStyle}" onclick="window.location.href='/totp-setup'">Vervangen</button>
-        <button style="${btnDanger}" onclick="disableTotp()">Uitschakelen</button>`;
+      el.innerHTML = `<span style="color:#166534;font-weight:600">&#10003; Actief</span>`
+        + `<button class="btn-auth" onclick="if(confirm('TOTP-sleutel vervangen? Je moet daarna je authenticator-app opnieuw instellen.'))window.location.href='/totp-setup'">Vervangen</button>`
+        + `<button class="btn-auth btn-auth-danger" onclick="disableTotp()">Uitschakelen</button>`;
     } else {
-      el.innerHTML = `<span style="color:#9ca3af">Niet actief (e-mail/Telegram OTP)</span>
-        &nbsp;<button style="${btnPrimary}" onclick="window.location.href='/totp-setup'">Instellen</button>`;
+      el.innerHTML = `<span style="color:#9ca3af">Niet actief (e-mail/Telegram OTP)</span>`
+        + `<button class="btn-auth btn-auth-primary" onclick="window.location.href='/totp-setup'">Instellen</button>`;
     }
   } catch(e) {}
 }
@@ -1542,8 +1574,33 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function fmtUptime(secs) {
+  if (secs < 60) return secs + 's';
+  const m = Math.floor(secs / 60) % 60, h = Math.floor(secs / 3600) % 24, d = Math.floor(secs / 86400);
+  if (d) return d + 'd ' + h + 'u';
+  if (h) return h + 'u ' + m + 'm';
+  return m + 'm';
+}
+
+async function loadStats() {
+  try {
+    const r = await fetch('/api/overview');
+    if (!r.ok) return;
+    const d = await r.json();
+    document.getElementById('k-tls').textContent = d.active_tls;
+    document.getElementById('k-tcp').textContent = d.active_tcp;
+    const total = d.tls_routes.reduce((s, r) => s + (r.ok || 0), 0)
+                + d.tcp_routes.reduce((s, r) => s + (r.ok || 0), 0);
+    document.getElementById('k-total').textContent = total;
+    document.getElementById('k-unknown').textContent = d.unknown_sni || 0;
+    document.getElementById('k-uptime').textContent = fmtUptime(d.uptime_secs);
+  } catch (e) {}
+}
+
 load();
 loadTcp();
+loadStats();
+setInterval(loadStats, 15000);
 
 // ── Terminal ──────────────────────────────────────────────────────────────────
 let _termWs = null, _termObj = null;
@@ -2265,6 +2322,7 @@ async def handle_admin(
                      "rejected": _stats["tcp_rej"].get(b.name, 0)}
                     for p, b in proxy_server.cfg.tcp_routes.items()
                 ],
+                "unknown_sni": _stats["tls_unknown"],
             })
 
         elif method == "POST" and path == "/api/reload":
@@ -2273,7 +2331,8 @@ async def handle_admin(
 
         elif method == "GET" and path == "/api/routes":
             routes = [
-                {"hostname": h, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
+                {"hostname": h, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
+                 "ok": _stats["tls_ok"].get(h, 0), "rejected": _stats["tls_rej"].get(h, 0)}
                 for h, b in proxy_server.cfg.tls_routes.items()
             ]
             respond(200, "application/json", json.dumps(routes).encode())
@@ -2326,7 +2385,8 @@ async def handle_admin(
 
         elif method == "GET" and path == "/api/tcp-routes":
             routes = [
-                {"listen_port": p, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
+                {"listen_port": p, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
+                 "ok": _stats["tcp_ok"].get(b.name, 0), "rejected": _stats["tcp_rej"].get(b.name, 0)}
                 for p, b in proxy_server.cfg.tcp_routes.items()
             ]
             respond(200, "application/json", json.dumps(routes).encode())
