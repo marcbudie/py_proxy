@@ -207,11 +207,14 @@ Na het invullen: `systemctl reload py-proxy` (geen herstart nodig). Als het toke
 
 | Commando | Omschrijving |
 |---------|-------------|
-| `/status` | Uptime, actieve verbindingen, statistieken per route + toggle-knoppen |
-| `/cert`   | Vervaldatums van alle geconfigureerde certificaten (🟢/🟡/🔴) |
-| `/logs`   | Laatste 30 logregels uit journald |
-| `/reload` | Config herladen zonder herstart (zelfde als `systemctl reload`) |
-| `/help`   | Beschikbare commando's |
+| `/status`    | Uptime, actieve verbindingen, statistieken per route + toggle-knoppen |
+| `/cert`      | Vervaldatums van alle geconfigureerde certificaten (🟢/🟡/🔴) |
+| `/logs`      | Laatste 30 logregels uit journald |
+| `/reload`    | Config herladen zonder herstart (zelfde als `systemctl reload`) |
+| `/clear`     | Verbindingstellers resetten (runtime statistieken, gereset bij herstart) |
+| `/proxyaan`  | Route `proxy.budie.eu` inschakelen — bruikbaar als de TLS route uit staat en de admin UI onbereikbaar is |
+| `/proxyuit`  | Route `proxy.budie.eu` uitschakelen |
+| `/help`      | Beschikbare commando's |
 
 ### Toggle-knoppen
 
