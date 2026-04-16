@@ -71,6 +71,7 @@ _sessions:  dict[str, float]              = {}   # token → expires_at
 _last_code_ts: float                      = 0.0  # tijdstip laatste code-aanvraag (globaal)
 _code_ts_per_ip: dict[str, float]         = {}   # ip → tijdstip laatste code-aanvraag
 _verify_attempts: int                     = 0    # foutieve verify-pogingen sinds laatste code
+_active_ws_tokens: set[str]               = set() # sessietokens met een actieve terminal WS
 
 # Alert-cooldowns (voorkomt spam bij aanhoudende backend-problemen)
 _alert_cooldowns: dict[str, float] = {}  # backend_name → tijdstip laatste alert
@@ -448,10 +449,12 @@ def _check_session(token: Optional[str]) -> bool:
     if not token:
         return False
     exp = _sessions.get(token)
-    if exp is None or time.time() > exp:
+    now = time.time()
+    if exp is None or now > exp:
         if token in _sessions:
             del _sessions[token]
         return False
+    _sessions[token] = now + SESSION_TTL  # sliding expiry
     return True
 
 
@@ -709,7 +712,7 @@ async def handle_connection(
         )
 
     except Exception as exc:
-        logger.exception(f"[{src}] unhandled error: {exc}")
+        logger.error(f"[{src}] unhandled error: {exc.__class__.__name__}: {exc}")
     finally:
         if _is_active:
             _stats["active_tls"] -= 1
@@ -2004,7 +2007,7 @@ async def handle_tcp_connection(
             pipe(be_reader, writer, f"{backend.name}→{src}"),
         )
     except Exception as exc:
-        logger.exception(f"[{src}] TCP unhandled: {exc}")
+        logger.error(f"[{src}] TCP unhandled: {exc.__class__.__name__}: {exc}")
     finally:
         if _is_active:
             _stats["active_tcp"] -= 1
@@ -2064,6 +2067,10 @@ async def handle_admin(
                 writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 await writer.drain()
                 return
+            if session_token in _active_ws_tokens:
+                writer.write(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+                return
             ws_key = headers_raw.get('sec-websocket-key', '')
             writer.write((
                 "HTTP/1.1 101 Switching Protocols\r\n"
@@ -2073,7 +2080,11 @@ async def handle_admin(
             ).encode())
             await writer.drain()
             logger.info("Terminal WebSocket geopend")
-            await handle_terminal_ws(reader, writer)
+            _active_ws_tokens.add(session_token)
+            try:
+                await handle_terminal_ws(reader, writer)
+            finally:
+                _active_ws_tokens.discard(session_token)
             return
 
         STATUS_TEXTS = {
@@ -2806,6 +2817,9 @@ class ProxyServer:
             if (cert, key) in ctxs:
                 continue
             try:
+                mode = os.stat(key).st_mode & 0o177
+                if mode != 0o600:
+                    logger.warning(f"Private key {key} heeft te brede permissies: {oct(0o100000 | mode)}")
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(cert, key)
                 ctxs[(cert, key)] = ctx
@@ -2840,13 +2854,18 @@ class ProxyServer:
 
     def reload(self) -> None:
         logger.info("SIGHUP received — reloading config")
-        old_token = self.cfg.telegram.bot_token
+        old_cfg = self.cfg
+        old_ssl_ctxs = self._ssl_ctxs
         try:
-            self.cfg = load_config(self.config_path)
-            self._ssl_ctxs = self._load_ssl_ctxs()
+            new_cfg = load_config(self.config_path)
+            self.cfg = new_cfg
+            new_ssl_ctxs = self._load_ssl_ctxs()
+            self._ssl_ctxs = new_ssl_ctxs
             log_config(self.cfg)
         except Exception as exc:
-            logger.error(f"Config reload failed: {exc} — keeping old config")
+            self.cfg = old_cfg
+            self._ssl_ctxs = old_ssl_ctxs
+            logger.error(f"Config reload failed: {exc} — kept old config")
             return
         # Herstart Telegram bot als het token is gewijzigd
         new_token = self.cfg.telegram.bot_token
@@ -2909,7 +2928,14 @@ class ProxyServer:
             self._daily_task = None
             logger.info("Telegram bot niet geconfigureerd (geen bot_token in config.json)")
 
+        asyncio.create_task(self._cleanup_task_loop())
         await asyncio.gather(*(srv.serve_forever() for srv in self._servers))
+
+    async def _cleanup_task_loop(self) -> None:
+        """Ruim verlopen OTP-codes en sessies elke 60 seconden op."""
+        while True:
+            await asyncio.sleep(60)
+            _cleanup_expired()
 
     async def _daily_task_loop(self) -> None:
         """Dagelijks om 08:00 UTC: stuur statussamenvatting en check cert-vervaldatums."""
