@@ -40,6 +40,20 @@ python3 proxy.py                   # of direct, gebruikt config.json in huidige 
 python3 proxy.py pad/naar/config.json
 ```
 
+## Netwerkarchitectuur
+
+Alle inkomende verbindingen lopen via de firewall naar de proxy. De proxy beslist op basis van SNI (TLS) of poortnummer (TCP) waar het verkeer naartoe gaat.
+
+```
+Internet
+  │
+  ├─ :443  ──► proxy:8444  ──► SNI router ──► backend per hostname
+  ├─ :2222 ──► proxy:2222  ──► tcp_route  ──► 192.168.2.76:22 (SSH)
+  └─ :300  ──► proxy:3333  ──► tcp_route  ──► 192.168.2.76:300 (ThinLinc)
+```
+
+De admin UI (poort 9443) is niet direct open in de firewall — alleen bereikbaar via de TLS route `proxy.budie.eu` (SNI → poort 9443 op localhost).
+
 ## Poorten
 
 | Poort | Functie |
@@ -196,6 +210,13 @@ Onder `/status` staat een inline-keyboard met één knop per route. Klikken togg
 
 Per TLS-route: aantal succesvolle verbindingen en geweigerd (route uitgeschakeld).  
 Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
+
+## Veiligheid
+
+- **Root uitvoering** — de service draait als root. Nette oplossing: bestanden naar `/opt/py_proxy` verplaatsen en een dedicated systeemgebruiker aanmaken, dan vervalt ook het SELinux-probleem. Zolang de proxy in `/home/admin` staat is root de enige werkende optie op SELinux-systemen.
+- **config.json** — bevat Gmail app-wachtwoord en Telegram bot-token. Nooit in git committen. Alleen leesbaar als root (acceptabel).
+- **Telegram bot** — bot-commando's werken via outbound long-polling; de `proxy.budie.eu` TLS route hoeft **niet** actief te zijn. De Mini App (`/app`) vereist de route **wel** — die wordt geserveerd via de admin UI op poort 9443.
+- **FreeCourts firewall-regel** (8444→8443) — omzeilt de proxy volledig. Nu disabled; niet inschakelen tenzij bewust gewenst.
 
 ## Bekende valkuilen
 
