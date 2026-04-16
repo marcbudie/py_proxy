@@ -7,20 +7,20 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 - `proxy.py` — de volledige proxy, één bestand, geen externe dependencies
 - `config.json` — runtime configuratie (wordt live bijgehouden door de admin UI, **niet in git** vanwege Gmail app-wachtwoord)
 - `requirements.txt` — leeg (alles stdlib); aanwezig voor consistentie
-- `run.sh` — start de proxy direct vanuit de venv (voor handmatig testen)
-- `proxy.service` — systemd service unit
-- `install.sh` — maakt venv aan en installeert/herstart de systemd service
+- `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen)
+- `proxy.service` — systemd service unit (draait als root met `/usr/bin/python3`)
+- `install.sh` — installeert en herstart de systemd service
 - `backup.sh` — sync naar Google Drive via rclone (`google:backup/py_proxy`)
 
 ## Installeren en starten
 
-### Via systemd + venv (aanbevolen)
+### Via systemd (aanbevolen)
 
 ```bash
-sudo bash install.sh   # maakt venv aan, installeert en start systemd service
+sudo bash install.sh   # installeert en start systemd service
 ```
 
-De service heet `py-proxy`. Handige commando's:
+De service heet `py-proxy` en draait als root met `/usr/bin/python3`. Handige commando's:
 
 ```bash
 systemctl status  py-proxy        # status bekijken
@@ -30,12 +30,12 @@ systemctl restart py-proxy        # herstarten na nieuwe versie
 ```
 
 Na een wijziging van `proxy.py` is alleen `systemctl restart py-proxy` nodig.  
-`sudo bash install.sh` opnieuw uitvoeren is alleen nodig bij een nieuwe checkout of als `requirements.txt` verandert.
+`sudo bash install.sh` opnieuw uitvoeren is alleen nodig bij een verse checkout.
 
 ### Direct (ontwikkeling)
 
 ```bash
-bash run.sh                        # via venv
+bash run.sh                        # met /usr/bin/python3
 python3 proxy.py                   # of direct, gebruikt config.json in huidige map
 python3 proxy.py pad/naar/config.json
 ```
@@ -199,6 +199,7 @@ Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 
 ## Bekende valkuilen
 
+- De service draait als root met `/usr/bin/python3` — geen venv. Op SELinux-systemen (RHEL/AlmaLinux) blokkeert SELinux het uitvoeren van binaries met `user_home_t` context vanuit systemd (`init_t`). Gebruik daarom altijd de systeem-python3 in de service.
 - Admin poort is 9443 — HTTPS verplicht, proxy weigert te starten zonder geldig `tls_cert`/`tls_key`.
 - `config.json` staat niet in git vanwege het Gmail app-wachtwoord en Telegram bot-token — na een verse checkout handmatig aanmaken.
 - De admin UI gebruikt `Connection: keep-alive` met een `while True` loop zodat de TLS-verbinding open blijft na een response. Zonder keep-alive stuurt asyncio's SSL-transport een TCP RST als de browser's `close_notify` nog in de buffer zit.
