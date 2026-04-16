@@ -2571,8 +2571,14 @@ async def _tg_handle_message(
     if not text.startswith("/"):
         return
     command = text.split()[0].lower().split("@")[0]
-    if command in ("/status", "/start"):
+    if command == "/status":
         await _tg_send_status(token, chat_id, proxy.cfg)
+    elif command == "/start":
+        await asyncio.to_thread(_tg_call, token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "🟢 <b>SNI Proxy</b> actief. Gebruik /status voor routes en toggle-knoppen.",
+            "parse_mode": "HTML",
+        })
     elif command == "/help":
         await asyncio.to_thread(_tg_call, token, "sendMessage", {
             "chat_id": chat_id,
@@ -2820,13 +2826,6 @@ class ProxyServer:
                 token = self.cfg.telegram.bot_token
                 if not token:
                     continue
-
-                # Dagelijkse statussamenvatting
-                for chat_id in self.cfg.telegram.allowed_chat_ids:
-                    try:
-                        await _tg_send_status(token, chat_id, self.cfg)
-                    except Exception as exc:
-                        logger.warning(f"Dagelijkse samenvatting naar {chat_id} mislukt: {exc}")
 
                 # Cert-vervaldatums controleren
                 now_utc = datetime.now(timezone.utc)
