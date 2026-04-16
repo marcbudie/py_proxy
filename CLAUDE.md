@@ -182,14 +182,14 @@ TOTP uitschakelen: dashboard → "Authenticatie: Uitschakelen" — valt terug op
 #### Legacy OTP (fallback als TOTP niet actief is)
 
 1. Bezoek `/login` — klik op "Stuur inlogcode"
-2. Een eenmalige 6-cijferige code wordt verstuurd via e-mail en/of Telegram
+2. Een eenmalige 8-cijferige code wordt verstuurd via e-mail en/of Telegram
 3. Vul de code in — bij succes wordt een sessiecookie gezet (geldig 30 minuten)
 
-**Limieten:** code is 5 minuten geldig en eenmalig bruikbaar; minimaal 60 seconden tussen aanvragen; na 10 foutieve pogingen wordt de code ongeldig gemaakt.
+**Limieten:** code is 5 minuten geldig en eenmalig bruikbaar; minimaal 60 seconden tussen aanvragen per IP-adres; na 10 foutieve pogingen wordt de code ongeldig gemaakt.
 
 #### Sessiecookie
 
-`proxy_session`; `HttpOnly; Secure; SameSite=Strict`; geldig 30 minuten.
+`proxy_session`; `HttpOnly; Secure; SameSite=Strict`; sliding expiry van 30 minuten (elke geauthenticeerde request verlengt de TTL — na 30 minuten inactiviteit wordt de sessie ongeldig).
 
 ### API-endpoints
 
@@ -228,7 +228,7 @@ Voeg toe aan `config.json`:
 ```
 
 - `bot_token` — token van de BotFather
-- `allowed_chat_ids` — lijst van toegestane chat-IDs (leeg = iedereen, niet aanbevolen)
+- `allowed_chat_ids` — lijst van toegestane chat-IDs (**leeg = niemand toegestaan** voor de Mini App; voor de bot zelf geen effect)
 
 Na het invullen: `systemctl reload py-proxy` (geen herstart nodig). Als het token wijzigt wordt de bot automatisch herstart bij reload.
 
@@ -272,6 +272,9 @@ Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 - **TOTP-geheim** — sla een back-up op bij het instellen. Zonder back-up en zonder werkende e-mail/Telegram-fallback ben je buitengesloten als je de authenticator-app kwijtraakt.
 - **Telegram bot** — bot-commando's werken via outbound long-polling; de `proxy.budie.eu` TLS route hoeft **niet** actief te zijn. De Mini App (`/app`) vereist de route **wel** — die wordt geserveerd via de admin UI op poort 9443.
 - **FreeCourts firewall-regel** (8444→8443) — omzeilt de proxy volledig. Nu disabled; niet inschakelen tenzij bewust gewenst.
+- **TLS private keys** — proxy logt een waarschuwing bij opstarten als een key-bestand bredere permissies heeft dan `0o600`.
+- **Terminal WebSocket** (`/term_sock`) — maximaal 1 gelijktijdige sessie per sessie-token; tweede poging krijgt HTTP 409.
+- **Telegram /logs** — filtert regels met `password`, `secret`, `token` of `key` vóór verzending naar Telegram.
 
 ## Bekende valkuilen
 

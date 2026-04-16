@@ -533,25 +533,32 @@ def _totp_verify(code: str, secret_b32: str, window: int = 1) -> bool:
     """Verifieer een TOTP-code; sta ±window tijdstappen toe voor klokafwijking.
     Markeert de gebruikte stap om replay-aanvallen te voorkomen.
     Binnen _TOTP_GRACE seconden na first-use wordt dezelfde stap nogmaals geaccepteerd
-    (browsers sturen de POST soms twee keer op aparte TCP-verbindingen)."""
+    (browsers sturen de POST soms twee keer op aparte TCP-verbindingen).
+    Alle kandidaat-codes worden altijd berekend en vergeleken (constant-time)."""
     now = time.time()
     step = int(now // 30)
-    for delta in range(-window, window + 1):
-        s = step + delta
+    steps = [step + delta for delta in range(-window, window + 1)]
+    # Bereken alle codes en vergelijk alle — geen early-exit om timing-lekkage te voorkomen
+    matched_step = None
+    for s in steps:
         if hmac.compare_digest(_totp_code(secret_b32, s), code):
-            first_use = _totp_used_steps.get(s)
-            if first_use is None:
-                # Eerste gebruik — markeer en accepteer
-                _totp_used_steps[s] = now
-                # Opruimen van oude stappen (ouder dan window + extra marge)
-                cutoff = step - window - 10
-                for old in [k for k in _totp_used_steps if k < cutoff]:
-                    del _totp_used_steps[old]
-                return True
-            if now - first_use <= _TOTP_GRACE:
-                # Tweede verzoek binnen genade-periode — browser double-submit
-                return True
-            # Stap al gebruikt buiten genade-periode: replay-aanval
+            matched_step = s  # overschrijf bij elke match; slaat laatste op
+    if matched_step is None:
+        return False
+    # Atomaire insert: setdefault geeft bestaande waarde terug als stap al bekend is
+    first_use = _totp_used_steps.setdefault(matched_step, now)
+    if first_use == now:
+        # Eerste gebruik — opruimen van oude stappen
+        cutoff = step - window - 10
+        for old in [k for k in _totp_used_steps if k < cutoff]:
+            del _totp_used_steps[old]
+        if len(_totp_used_steps) > 500:
+            _totp_used_steps.clear()
+        return True
+    if now - first_use <= _TOTP_GRACE:
+        # Tweede verzoek binnen genade-periode — browser double-submit
+        return True
+    # Stap al gebruikt buiten genade-periode: replay-aanval
     return False
 
 
@@ -2052,6 +2059,10 @@ async def handle_admin(
                     pass
 
         body = b""
+        if content_length > 65536:
+            writer.write(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
         if content_length > 0:
             body = await asyncio.wait_for(reader.read(min(content_length, 4096)), timeout=10)
 
@@ -2143,7 +2154,10 @@ async def handle_admin(
                     if allowed:
                         try:
                             params = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
-                            user_id = json.loads(params.get("user", "{}")).get("id")
+                            user_str = params.get("user", "")
+                            if not user_str.startswith("{"):
+                                raise ValueError("user field is not a JSON object")
+                            user_id = json.loads(user_str).get("id")
                             authorized = user_id in allowed
                         except Exception:
                             authorized = False
