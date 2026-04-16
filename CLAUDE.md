@@ -41,21 +41,15 @@ Na een update van `proxy.py`: `sudo bash install.sh` opnieuw uitvoeren (kopieert
 
 #### Cert-bestanden toegankelijk maken voor pyproxy
 
-De certs staan in `/home/admin/ssl/` en zijn standaard niet leesbaar voor `pyproxy`. Fix per bestand:
+De certs staan in `/home/admin/ssl/` en zijn world-readable, maar `/home/admin` zelf heeft geen traverse-rechten voor anderen. `install.sh` zet dit automatisch:
 
 ```bash
-setfacl -m u:pyproxy:r /home/admin/ssl/ClouDNS/MarcBudie.crt
-setfacl -m u:pyproxy:r /home/admin/ssl/ClouDNS/MarcBudie.key
-setfacl -m u:pyproxy:r /home/admin/ssl/freecourts/fullchain_padel.freecourts.nl.crt
-setfacl -m u:pyproxy:r /home/admin/ssl/freecourts/padel.freecourts.nl.key
-# Traverse-rechten op de parent-directories
-setfacl -m u:pyproxy:x /home/admin/ssl/ClouDNS
-setfacl -m u:pyproxy:x /home/admin/ssl/freecourts
-setfacl -m u:pyproxy:x /home/admin/ssl
 setfacl -m u:pyproxy:x /home/admin
 ```
 
-`install.sh` waarschuwt automatisch welke bestanden niet leesbaar zijn.
+De subdirectories (`ssl/`, `ssl/ClouDNS/`, `ssl/freecourts/`) zijn `drwxr-xr-x` en de certbestanden zijn `-rw-r--r--` — na de traverse-ACL op `/home/admin` zijn ze direct leesbaar.
+
+`install.sh` controleert daarna of alle cert-bestanden leesbaar zijn en waarschuwt bij problemen.
 
 ### Direct (ontwikkeling)
 

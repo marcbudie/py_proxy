@@ -53,13 +53,22 @@ if command -v restorecon &>/dev/null; then
     echo "SELinux context hersteld voor $DEPLOY_DIR."
 fi
 
+# Geef pyproxy traverse-rechten op /home/admin zodat certs bereikbaar zijn
+echo ""
+echo "--- Traverse-rechten /home/admin instellen ---"
+if setfacl -m "u:${SERVICE_USER}:x" /home/admin 2>/dev/null; then
+    echo "  ACL gezet: pyproxy mag /home/admin inlopen."
+else
+    echo "  WAARSCHUWING: kon ACL niet zetten op /home/admin — certs mogelijk niet leesbaar."
+fi
+
 # Controleer of cert-bestanden leesbaar zijn voor pyproxy
 echo ""
 echo "--- Cert-toegang controleren ---"
 CERT_OK=true
 for certfile in \
-    "$(python3 -c "import json,sys; c=json.load(open('$DEPLOY_DIR/config.json')); print(c.get('tls_cert',''))" 2>/dev/null)" \
-    "$(python3 -c "import json,sys; c=json.load(open('$DEPLOY_DIR/config.json')); print(c.get('tls_key',''))" 2>/dev/null)"; do
+    "$(python3 -c "import json; c=json.load(open('$DEPLOY_DIR/config.json')); print(c.get('tls_cert',''))" 2>/dev/null)" \
+    "$(python3 -c "import json; c=json.load(open('$DEPLOY_DIR/config.json')); print(c.get('tls_key',''))" 2>/dev/null)"; do
     [[ -z "$certfile" ]] && continue
     if ! sudo -u "$SERVICE_USER" test -r "$certfile" 2>/dev/null; then
         echo "  WAARSCHUWING: $certfile niet leesbaar voor $SERVICE_USER"
