@@ -157,25 +157,45 @@ Wijzigingen worden direct actief en opgeslagen in `config.json` zonder herstart.
 
 ### Authenticatie
 
-De admin UI gebruikt OTP-authenticatie via e-mail en/of Telegram:
+De admin UI ondersteunt twee methoden:
+
+#### TOTP (aanbevolen — Google Authenticator, Authy, Bitwarden)
+
+1. Ga naar `/totp-setup` (vereist een actieve sessie — stel dus eerst in via legacy OTP)
+2. Kopieer het geheim en voeg het toe aan je authenticator-app
+3. Verifieer met een code uit de app — bij succes wordt `totp_secret` opgeslagen in `config.json`
+4. Daarna toont `/login` direct een invoerveld voor de TOTP-code (geen e-mail/Telegram meer)
+
+Bij succesvolle TOTP-inlog wordt een Telegram-melding verstuurd. Het geheim is 20 bytes (160 bits), base32 gecodeerd. Replay-aanvallen worden geblokkeerd via een set van gebruikte time-steps.
+
+TOTP uitschakelen: dashboard → "Authenticatie: Uitschakelen" — valt terug op e-mail/Telegram OTP.
+
+#### Legacy OTP (fallback als TOTP niet actief is)
 
 1. Bezoek `/login` — klik op "Stuur inlogcode"
-2. Een eenmalige 6-cijferige code wordt verstuurd naar alle geconfigureerde kanalen (e-mail en/of Telegram)
+2. Een eenmalige 6-cijferige code wordt verstuurd via e-mail en/of Telegram
 3. Vul de code in — bij succes wordt een sessiecookie gezet (geldig 30 minuten)
-4. Uitloggen via de knop rechtsboven in de UI
 
 **Limieten:** code is 5 minuten geldig en eenmalig bruikbaar; minimaal 60 seconden tussen aanvragen; na 10 foutieve pogingen wordt de code ongeldig gemaakt.
 
-E-mail wordt verstuurd via Gmail SMTP (`gmail_user` + `gmail_app_password` in config.json). Telegram verstuurt de code naar alle `allowed_chat_ids`. Minstens één kanaal moet geconfigureerd zijn; als één kanaal faalt maar het andere slaagt, is inloggen nog steeds mogelijk.
+#### Sessiecookie
+
+`proxy_session`; `HttpOnly; Secure; SameSite=Strict`; geldig 30 minuten.
 
 ### API-endpoints
 
 | Methode | Pad | Omschrijving |
 |---------|-----|--------------|
-| GET | `/login` | Inlogpagina (HTML) |
-| POST | `/api/auth/request-code` | Vraag OTP-code aan (verstuurt via e-mail en/of Telegram) |
-| POST | `/api/auth/verify` | Verifieer OTP-code, ontvangt sessiecookie |
+| GET | `/login` | Inlogpagina (HTML) — toont TOTP- of legacy OTP-formulier |
+| POST | `/api/auth/request-code` | Vraag legacy OTP-code aan (e-mail en/of Telegram) |
+| POST | `/api/auth/verify` | Verifieer legacy OTP-code, ontvangt sessiecookie |
+| POST | `/api/auth/verify-totp` | Verifieer TOTP-code, ontvangt sessiecookie |
 | POST | `/api/auth/logout` | Sessie beëindigen |
+| GET | `/totp-setup` | TOTP setup pagina (sessie vereist) |
+| GET | `/api/totp/new-secret` | Genereer nieuw TOTP-geheim (sessie vereist) |
+| POST | `/api/totp/enable` | Activeer TOTP na verificatie (body: `secret`, `code`) |
+| POST | `/api/totp/disable` | Deactiveer TOTP, valt terug op legacy OTP |
+| GET | `/api/totp/status` | Geeft `{"enabled": bool}` |
 | GET | `/api/routes` | Lijst van alle TLS routes |
 | POST | `/api/routes` | Nieuwe TLS route toevoegen (JSON body: `hostname`, `host`, `port`, `name`) |
 | POST | `/api/routes/<hostname>/toggle` | TLS route aan/uit schakelen |
@@ -238,7 +258,8 @@ Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 ## Veiligheid
 
 - **Dedicated systeemgebruiker** — de service draait als `pyproxy` (geen login shell, geen home dir) vanuit `/opt/py_proxy`. Dit beperkt de blast radius bij een eventuele kwetsbaarheid.
-- **config.json** — bevat Gmail app-wachtwoord en Telegram bot-token. Nooit in git committen. Alleen leesbaar als root (acceptabel).
+- **config.json** — bevat Gmail app-wachtwoord, Telegram bot-token en TOTP-geheim. Nooit in git committen. Alleen leesbaar als root (acceptabel).
+- **TOTP-geheim** — sla een back-up op bij het instellen. Zonder back-up en zonder werkende e-mail/Telegram-fallback ben je buitengesloten als je de authenticator-app kwijtraakt.
 - **Telegram bot** — bot-commando's werken via outbound long-polling; de `proxy.budie.eu` TLS route hoeft **niet** actief te zijn. De Mini App (`/app`) vereist de route **wel** — die wordt geserveerd via de admin UI op poort 9443.
 - **FreeCourts firewall-regel** (8444→8443) — omzeilt de proxy volledig. Nu disabled; niet inschakelen tenzij bewust gewenst.
 
