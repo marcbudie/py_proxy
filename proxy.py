@@ -149,6 +149,7 @@ class Config:
     email: EmailConfig = None
     tcp_routes: dict = None           # listen_port (int) → Backend
     telegram: TelegramConfig = None
+    totp_secret: str = ""             # base32 TOTP secret; leeg = TOTP niet actief
 
     def __post_init__(self):
         if self.email is None:
@@ -211,6 +212,7 @@ def load_config(path: Path) -> Config:
         email=email_cfg,
         tcp_routes={int(p): _parse_backend(b) for p, b in raw.get("tcp_routes", {}).items()},
         telegram=telegram_cfg,
+        totp_secret=raw.get("totp_secret", ""),
     )
 
 
@@ -246,6 +248,7 @@ def save_config(cfg: Config, path: Path) -> None:
             "allowed_chat_ids": cfg.telegram.allowed_chat_ids,
             "mini_app_url": cfg.telegram.mini_app_url,
         },
+        "totp_secret": cfg.totp_secret,
     }
     path.write_text(json.dumps(data, indent=2))
 
@@ -493,6 +496,47 @@ def _verify_otp(code: str) -> bool:
     _otp_store[code] = (expires_at, True)  # markeer als gebruikt
     _verify_attempts = 0
     return True
+
+
+# ── TOTP (RFC 6238) ───────────────────────────────────────────────────────────
+
+_totp_used_steps: set[int] = set()   # replay-bescherming: gebruikte time-steps
+
+
+def _totp_code(secret_b32: str, step: int) -> str:
+    """Bereken TOTP-code voor een gegeven time-step (HMAC-SHA1, 6 cijfers)."""
+    key = base64.b32decode(secret_b32.upper().replace(" ", "").replace("-", ""))
+    msg = step.to_bytes(8, "big")
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = h[-1] & 0x0F
+    code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFF_FFFF
+    return f"{code % 1_000_000:06d}"
+
+
+def _totp_verify(code: str, secret_b32: str, window: int = 1) -> bool:
+    """Verifieer een TOTP-code; sta ±window tijdstappen toe voor klokafwijking.
+    Markeert de gebruikte stap om replay-aanvallen te voorkomen."""
+    step = int(time.time() // 30)
+    for delta in range(-window, window + 1):
+        s = step + delta
+        if s not in _totp_used_steps and hmac.compare_digest(_totp_code(secret_b32, s), code):
+            _totp_used_steps.add(s)
+            _totp_used_steps.discard(s - 10)   # opruimen van oude stappen
+            return True
+    return False
+
+
+def _totp_new_secret() -> str:
+    """Genereer een nieuw willekeurig base32 TOTP-geheim (20 bytes = 160 bits)."""
+    return base64.b32encode(secrets.token_bytes(20)).decode()
+
+
+def _totp_uri(secret: str, issuer: str = "SNI Proxy", account: str = "admin") -> str:
+    """Genereer otpauth:// URI voor QR-code of handmatige invoer in authenticator-app."""
+    issuer_enc  = urllib.parse.quote(issuer)
+    account_enc = urllib.parse.quote(account)
+    return (f"otpauth://totp/{issuer_enc}:{account_enc}"
+            f"?secret={secret}&issuer={issuer_enc}&algorithm=SHA1&digits=6&period=30")
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────
@@ -803,7 +847,111 @@ _LOGO_INLINE = """\
 _LOGO_36 = _LOGO_INLINE.format(size=36)
 _LOGO_32 = _LOGO_INLINE.format(size=32)
 
-LOGIN_HTML = """\
+def _make_login_html(totp_enabled: bool) -> str:
+    """Genereer de inlogpagina: TOTP-modus als totp_enabled, anders legacy OTP."""
+    totp_block = """
+  <!-- TOTP modus: direct code invoeren vanuit authenticator-app -->
+  <div id="stepTotp" class="step active">
+    <p style="color:#555;font-size:.88rem;margin-bottom:1.25rem">
+      Voer de 6-cijferige code in uit je authenticator-app.
+    </p>
+    <input id="totpInput" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+           oninput="this.value=this.value.replace(/[^0-9]/g,'')"
+           onkeydown="if(event.key==='Enter')verifyTotp()">
+    <button id="btnTotp" onclick="verifyTotp()">Inloggen</button>
+    <div id="msgTotp" class="msg"></div>
+  </div>
+""" if totp_enabled else """
+  <!-- Legacy OTP modus: stap 1 = code aanvragen -->
+  <div id="step1" class="step active">
+    <button id="btnSend" onclick="requestCode()">Stuur inlogcode</button>
+    <p class="hint">Er wordt een eenmalige code verstuurd via e-mail en/of Telegram.</p>
+    <div id="msg1" class="msg"></div>
+  </div>
+
+  <!-- Legacy OTP modus: stap 2 = code invoeren -->
+  <div id="step2" class="step">
+    <p style="color:#555;font-size:.88rem;margin-bottom:1.25rem">
+      Er is een 6-cijferige code verstuurd.<br>De code is 5 minuten geldig.
+    </p>
+    <input id="codeInput" type="text" maxlength="6" placeholder="000000"
+           oninput="this.value=this.value.replace(/[^0-9]/g,'')"
+           onkeydown="if(event.key==='Enter')verifyCode()">
+    <button id="btnVerify" onclick="verifyCode()">Inloggen</button>
+    <p class="hint" style="cursor:pointer" onclick="backToStep1()">&larr; Nieuwe code aanvragen</p>
+    <div id="msg2" class="msg"></div>
+  </div>
+"""
+
+    totp_script = """
+async function verifyTotp() {
+  const code = document.getElementById('totpInput').value.trim();
+  if (code.length !== 6) { setMsg('msgTotp', 'Voer een 6-cijferige code in.', false); return; }
+  const btn = document.getElementById('btnTotp');
+  btn.disabled = true; btn.textContent = 'Controleren\u2026';
+  try {
+    const r = await fetch('/api/auth/verify-totp', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code}),
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('msgTotp', d.error || 'Ongeldige code.', false); return; }
+    window.location.href = '/';
+  } catch (e) {
+    setMsg('msgTotp', 'Netwerkfout: ' + e, false);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Inloggen';
+  }
+}
+""" if totp_enabled else """
+function show(id) {
+  ['step1','step2'].forEach(s => document.getElementById(s).classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+async function requestCode() {
+  const btn = document.getElementById('btnSend');
+  btn.disabled = true; btn.textContent = 'Versturen\u2026';
+  setMsg('msg1', '', false);
+  try {
+    const r = await fetch('/api/auth/request-code', {method: 'POST'});
+    const d = await r.json();
+    if (!r.ok) { setMsg('msg1', d.error || 'Fout bij versturen.', false); return; }
+    show('step2');
+    document.getElementById('codeInput').focus();
+  } catch (e) {
+    setMsg('msg1', 'Netwerkfout: ' + e, false);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Stuur inlogcode';
+  }
+}
+async function verifyCode() {
+  const code = document.getElementById('codeInput').value.trim();
+  if (code.length !== 6) { setMsg('msg2', 'Voer een 6-cijferige code in.', false); return; }
+  const btn = document.getElementById('btnVerify');
+  btn.disabled = true; btn.textContent = 'Controleren\u2026';
+  try {
+    const r = await fetch('/api/auth/verify', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code}),
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('msg2', d.error || 'Ongeldige code.', false); return; }
+    window.location.href = '/';
+  } catch (e) {
+    setMsg('msg2', 'Netwerkfout: ' + e, false);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Inloggen';
+  }
+}
+function backToStep1() {
+  document.getElementById('codeInput').value = '';
+  setMsg('msg2', '', false);
+  show('step1');
+}
+"""
+
+    return ("""\
 <!DOCTYPE html>
 <html lang="nl">
 <head>
@@ -828,17 +976,15 @@ LOGIN_HTML = """\
   button:hover { background: #4f46e5; }
   button:disabled { background: #a5b4fc; cursor: wait; }
   input[type=text] { width: 100%; padding: .6rem .8rem; border: 1px solid #d1d5db;
-                     border-radius: 8px; font-size: 1.1rem; text-align: center;
-                     letter-spacing: .25em; margin-bottom: 1rem; }
+                     border-radius: 8px; font-size: 1.4rem; text-align: center;
+                     letter-spacing: .3em; margin-bottom: 1rem; }
   input[type=text]:focus { outline: 2px solid #6366f1; border-color: transparent; }
   .msg { margin-top: 1rem; padding: .6rem .9rem; border-radius: 8px;
          font-size: .85rem; display: none; }
   .msg-ok  { background: #dcf5e7; color: #166534; display: block; }
   .msg-err { background: #fde8e8; color: #991b1b; display: block; }
   .hint { color: #9ca3af; font-size: .8rem; margin-top: 1.5rem; }
-  @media (max-width: 400px) {
-    .card { padding: 2rem 1.25rem; width: 100%; }
-  }
+  @media (max-width: 400px) { .card { padding: 2rem 1.25rem; width: 100%; } }
 </style>
 </head>
 <body>
@@ -848,90 +994,176 @@ LOGIN_HTML = """\
     <h1>SNI Proxy</h1>
   </div>
   <p class="sub">Admin toegang vereist</p>
-
-  <!-- Stap 1: vraag code aan -->
-  <div id="step1" class="step active">
-    <button id="btnSend" onclick="requestCode()">Stuur inlogcode naar e-mail</button>
-    <p class="hint">Er wordt een eenmalige code naar het beheerders-e-mailadres verstuurd.</p>
-    <div id="msg1" class="msg"></div>
-  </div>
-
-  <!-- Stap 2: voer code in -->
-  <div id="step2" class="step">
-    <p style="color:#555;font-size:.88rem;margin-bottom:1.25rem">
-      Er is een 6-cijferige code naar je e-mail verstuurd.<br>
-      De code is 5 minuten geldig.
-    </p>
-    <input id="codeInput" type="text" maxlength="6" placeholder="000000"
-           oninput="this.value=this.value.replace(/[^0-9]/g,'')"
-           onkeydown="if(event.key==='Enter')verifyCode()">
-    <button id="btnVerify" onclick="verifyCode()">Inloggen</button>
-    <p class="hint" style="cursor:pointer" onclick="backToStep1()">
-      &larr; Nieuwe code aanvragen
-    </p>
-    <div id="msg2" class="msg"></div>
-  </div>
+""" + totp_block + """
 </div>
-
 <script>
-function show(id) {
-  document.getElementById('step1').classList.remove('active');
-  document.getElementById('step2').classList.remove('active');
-  document.getElementById(id).classList.add('active');
-}
 function setMsg(id, text, ok) {
   const el = document.getElementById(id);
   el.textContent = text;
   el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
 }
+""" + totp_script + """
+</script>
+</body>
+</html>
+""")
 
-async function requestCode() {
-  const btn = document.getElementById('btnSend');
-  btn.disabled = true;
-  btn.textContent = 'Versturen\u2026';
-  setMsg('msg1', '', false);
+
+TOTP_SETUP_HTML = """\
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNI Proxy — TOTP instellen</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f0f2f5;
+         display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; color: #222; padding: 1rem; }
+  .card { background: #fff; border-radius: 12px; padding: 2rem 2.5rem;
+          box-shadow: 0 2px 12px rgba(0,0,0,.12); width: 460px; max-width: 100%; }
+  h1 { font-size: 1.2rem; font-weight: 600; margin-bottom: .3rem; }
+  .sub { color: #888; font-size: .85rem; margin-bottom: 1.5rem; }
+  h2 { font-size: .9rem; font-weight: 600; color: #444; margin: 1.2rem 0 .5rem; }
+  .secret-box { background: #f7f7f7; border: 1px solid #e5e7eb; border-radius: 8px;
+                padding: .75rem 1rem; font-family: monospace; font-size: 1rem;
+                letter-spacing: .1em; word-break: break-all; color: #111;
+                display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+  .secret-text { flex: 1; }
+  .btn-copy { background: #6366f1; color: #fff; border: none; border-radius: 6px;
+              padding: .3rem .7rem; font-size: .8rem; cursor: pointer; white-space: nowrap; }
+  .btn-copy:hover { background: #4f46e5; }
+  .uri-box { background: #f7f7f7; border: 1px solid #e5e7eb; border-radius: 8px;
+             padding: .6rem .9rem; font-size: .75rem; font-family: monospace;
+             word-break: break-all; color: #555; margin-bottom: .4rem; }
+  ol { padding-left: 1.2rem; color: #555; font-size: .85rem; line-height: 1.7; margin-bottom: 1rem; }
+  input[type=text] { width: 100%; padding: .6rem .8rem; border: 1px solid #d1d5db;
+                     border-radius: 8px; font-size: 1.4rem; text-align: center;
+                     letter-spacing: .3em; margin-bottom: .75rem; }
+  input[type=text]:focus { outline: 2px solid #6366f1; border-color: transparent; }
+  .btn-primary { width: 100%; padding: .65rem; border: none; border-radius: 8px;
+                 background: #6366f1; color: #fff; font-size: .95rem; cursor: pointer;
+                 font-weight: 500; transition: background .15s; }
+  .btn-primary:hover { background: #4f46e5; }
+  .btn-primary:disabled { background: #a5b4fc; cursor: wait; }
+  .btn-back { display: block; margin-top: .75rem; text-align: center; color: #6366f1;
+              font-size: .85rem; text-decoration: none; cursor: pointer; background: none;
+              border: none; width: 100%; }
+  .msg { margin-top: .75rem; padding: .6rem .9rem; border-radius: 8px; font-size: .85rem; display: none; }
+  .msg-ok  { background: #dcf5e7; color: #166534; display: block; }
+  .msg-err { background: #fde8e8; color: #991b1b; display: block; }
+  .warn { background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px;
+          padding: .6rem .9rem; font-size: .83rem; color: #9a3412; margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔐 TOTP Authenticatie instellen</h1>
+  <p class="sub">Vervang e-mail/Telegram OTP door een authenticator-app</p>
+
+  <div id="setupSection">
+    <div class="warn">
+      ⚠️ Sla het geheim veilig op als back-up. Als je de app kwijtraakt
+      zonder back-up, ben je buitengesloten.
+    </div>
+
+    <h2>Stap 1 — Voeg toe aan je authenticator-app</h2>
+    <ol>
+      <li>Open Google Authenticator, Authy of Bitwarden</li>
+      <li>Kies "Account toevoegen" → "Sleutel handmatig invoeren"</li>
+      <li>Kopieer het geheim hieronder en plak het in de app</li>
+    </ol>
+
+    <div class="secret-box">
+      <span class="secret-text" id="secretText">Laden…</span>
+      <button class="btn-copy" onclick="copySecret()">Kopieer</button>
+    </div>
+
+    <h2>Stap 2 — Of gebruik de otpauth:// link</h2>
+    <p style="font-size:.82rem;color:#888;margin-bottom:.4rem">
+      Op mobiel kun je de link direct aantikken om de app te openen.
+    </p>
+    <div class="uri-box" id="uriBox">Laden…</div>
+    <button class="btn-copy" style="margin-bottom:1rem" onclick="copyUri()">Kopieer link</button>
+
+    <h2>Stap 3 — Verificatie</h2>
+    <p style="font-size:.85rem;color:#555;margin-bottom:.75rem">
+      Voer een code uit de app in om te bevestigen dat het klopt.
+    </p>
+    <input id="verifyInput" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+           oninput="this.value=this.value.replace(/[^0-9]/g,'')"
+           onkeydown="if(event.key==='Enter')enableTotp()">
+    <button class="btn-primary" id="btnEnable" onclick="enableTotp()">TOTP activeren</button>
+    <div id="msgSetup" class="msg"></div>
+  </div>
+
+  <button class="btn-back" onclick="window.location.href='/'">← Terug naar dashboard</button>
+</div>
+
+<script>
+let _secret = '', _uri = '';
+
+async function load() {
   try {
-    const r = await fetch('/api/auth/request-code', {method: 'POST'});
+    const r = await fetch('/api/totp/new-secret');
     const d = await r.json();
-    if (!r.ok) { setMsg('msg1', d.error || 'Fout bij versturen.', false); return; }
-    show('step2');
-    document.getElementById('codeInput').focus();
-  } catch (e) {
-    setMsg('msg1', 'Netwerkfout: ' + e, false);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Stuur inlogcode naar e-mail';
+    if (!r.ok) { document.getElementById('secretText').textContent = 'Fout: ' + d.error; return; }
+    _secret = d.secret;
+    _uri    = d.uri;
+    // Toon geheim in groepen van 4
+    document.getElementById('secretText').textContent =
+      _secret.match(/.{1,4}/g).join(' ');
+    document.getElementById('uriBox').textContent = _uri;
+  } catch(e) {
+    document.getElementById('secretText').textContent = 'Fout: ' + e;
   }
 }
 
-async function verifyCode() {
-  const code = document.getElementById('codeInput').value.trim();
-  if (code.length !== 6) { setMsg('msg2', 'Voer een 6-cijferige code in.', false); return; }
-  const btn = document.getElementById('btnVerify');
-  btn.disabled = true;
-  btn.textContent = 'Controleren\u2026';
+function copySecret() {
+  navigator.clipboard.writeText(_secret).then(() => {
+    const btn = event.target; btn.textContent = 'Gekopieerd!';
+    setTimeout(() => btn.textContent = 'Kopieer', 1500);
+  });
+}
+
+function copyUri() {
+  navigator.clipboard.writeText(_uri).then(() => {
+    const btn = event.target; btn.textContent = 'Gekopieerd!';
+    setTimeout(() => btn.textContent = 'Kopieer link', 1500);
+  });
+}
+
+function setMsg(text, ok) {
+  const el = document.getElementById('msgSetup');
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+}
+
+async function enableTotp() {
+  const code = document.getElementById('verifyInput').value.trim();
+  if (code.length !== 6) { setMsg('Voer een 6-cijferige code in.', false); return; }
+  const btn = document.getElementById('btnEnable');
+  btn.disabled = true; btn.textContent = 'Activeren\u2026';
   try {
-    const r = await fetch('/api/auth/verify', {
+    const r = await fetch('/api/totp/enable', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({code}),
+      body: JSON.stringify({secret: _secret, code}),
     });
     const d = await r.json();
-    if (!r.ok) { setMsg('msg2', d.error || 'Ongeldige code.', false); return; }
-    window.location.href = '/';
-  } catch (e) {
-    setMsg('msg2', 'Netwerkfout: ' + e, false);
+    if (!r.ok) { setMsg(d.error || 'Verificatie mislukt.', false); return; }
+    setMsg('TOTP geactiveerd! Je wordt doorgestuurd naar het dashboard.', true);
+    setTimeout(() => window.location.href = '/', 1800);
+  } catch(e) {
+    setMsg('Netwerkfout: ' + e, false);
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Inloggen';
+    btn.disabled = false; btn.textContent = 'TOTP activeren';
   }
 }
 
-function backToStep1() {
-  document.getElementById('codeInput').value = '';
-  setMsg('msg2', '', false);
-  show('step1');
-}
+load();
 </script>
 </body>
 </html>
@@ -1073,6 +1305,13 @@ ADMIN_HTML = """\
   </tbody>
 </table>
 
+<div class="add-card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
+  <div style="display:flex;align-items:center;gap:.75rem">
+    <span style="font-size:.85rem;font-weight:600;color:#444">🔐 Authenticatie:</span>
+    <span id="totpStatus" style="font-size:.85rem;color:#9ca3af">Laden&hellip;</span>
+  </div>
+</div>
+
 <div class="add-card">
   <h2>Route toevoegen</h2>
   <div class="fields">
@@ -1206,6 +1445,39 @@ async function logout() {
   await fetch('/api/auth/logout', {method: 'POST'});
   window.location.href = '/login';
 }
+
+async function disableTotp() {
+  if (!confirm('TOTP uitschakelen? Inloggen gaat dan weer via e-mail/Telegram.')) return;
+  const r = await fetch('/api/totp/disable', {method: 'POST'});
+  const d = await r.json();
+  if (r.ok) { showMsg('TOTP uitgeschakeld.', true); loadTotpStatus(); }
+  else showMsg(d.error || 'Fout.', false);
+}
+
+async function loadTotpStatus() {
+  try {
+    const r = await fetch('/api/totp/status');
+    const d = await r.json();
+    const el = document.getElementById('totpStatus');
+    if (!el) return;
+    if (d.enabled) {
+      el.innerHTML = '<span style="color:#166534;font-weight:600">✓ Actief</span>'
+        + ' &nbsp;<button onclick="window.location.href=\'/totp-setup\'" style="'
+        + 'border:1px solid #d1d5db;background:#f9fafb;border-radius:6px;padding:.25rem .7rem;'
+        + 'font-size:.8rem;cursor:pointer;">Vervangen</button>'
+        + ' <button onclick="disableTotp()" style="border:1px solid #fca5a5;background:#fef2f2;'
+        + 'border-radius:6px;padding:.25rem .7rem;font-size:.8rem;cursor:pointer;color:#b91c1c;">'
+        + 'Uitschakelen</button>';
+    } else {
+      el.innerHTML = '<span style="color:#9ca3af">Niet actief (e-mail/Telegram OTP)</span>'
+        + ' &nbsp;<button onclick="window.location.href=\'/totp-setup\'" style="'
+        + 'border:none;background:#6366f1;color:#fff;border-radius:6px;padding:.3rem .8rem;'
+        + 'font-size:.8rem;cursor:pointer;">Instellen</button>';
+    }
+  } catch(e) {}
+}
+
+loadTotpStatus();
 
 function showMsg(text, ok) {
   const el = document.getElementById('msg');
@@ -1764,7 +2036,8 @@ async def handle_admin(
             respond(200, "image/svg+xml", LOGO_SVG.encode())
 
         elif method == "GET" and path == "/login":
-            respond(200, "text/html; charset=utf-8", LOGIN_HTML.encode("utf-8"))
+            respond(200, "text/html; charset=utf-8",
+                    _make_login_html(bool(proxy_server.cfg.totp_secret)).encode("utf-8"))
 
         elif method == "POST" and path == "/api/auth/request-code":
             global _last_code_ts
@@ -1819,11 +2092,97 @@ async def handle_admin(
                 else:
                     json_resp(401, {"error": "Ongeldige of verlopen code."})
 
+        elif method == "POST" and path == "/api/auth/verify-totp":
+            if not proxy_server.cfg.totp_secret:
+                json_resp(400, {"error": "TOTP is niet geconfigureerd."})
+            else:
+                try:
+                    data = json.loads(body)
+                    code = str(data.get("code", "")).strip()
+                except Exception:
+                    json_resp(400, {"error": "Ongeldige invoer."})
+                else:
+                    if not code.isdigit() or len(code) != 6:
+                        json_resp(400, {"error": "Code moet 6 cijfers zijn."})
+                    elif _totp_verify(code, proxy_server.cfg.totp_secret):
+                        token = _create_session()
+                        cookie = (
+                            f"proxy_session={token}; Max-Age={SESSION_TTL}; "
+                            f"Path=/; HttpOnly; Secure; SameSite=Strict"
+                        )
+                        logger.info("Succesvolle inlog via TOTP")
+                        asyncio.ensure_future(
+                            _tg_send_message("🔐 Admin ingelogd via TOTP", proxy_server.cfg)
+                        )
+                        json_resp(200, {"ok": True}, [("Set-Cookie", cookie)])
+                    else:
+                        json_resp(401, {"error": "Ongeldige of al gebruikte code."})
+
         elif method == "POST" and path == "/api/auth/logout":
             if session_token and session_token in _sessions:
                 del _sessions[session_token]
             clear_cookie = "proxy_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"
             json_resp(200, {"ok": True}, [("Set-Cookie", clear_cookie)])
+
+        # ── TOTP beheer (sessie vereist) ──────────────────────────────────────
+
+        elif method == "GET" and path == "/totp-setup":
+            if not authed:
+                redirect("/login")
+            else:
+                respond(200, "text/html; charset=utf-8", TOTP_SETUP_HTML.encode("utf-8"))
+
+        elif method == "GET" and path == "/api/totp/new-secret":
+            if not authed:
+                json_resp(401, {"error": "Niet ingelogd."})
+            else:
+                new_secret = _totp_new_secret()
+                json_resp(200, {
+                    "secret": new_secret,
+                    "uri":    _totp_uri(new_secret),
+                })
+
+        elif method == "POST" and path == "/api/totp/enable":
+            if not authed:
+                json_resp(401, {"error": "Niet ingelogd."})
+            else:
+                try:
+                    data   = json.loads(body)
+                    secret = str(data.get("secret", "")).strip().upper().replace(" ", "")
+                    code   = str(data.get("code", "")).strip()
+                except Exception:
+                    json_resp(400, {"error": "Ongeldige invoer."})
+                else:
+                    if not secret or not code.isdigit() or len(code) != 6:
+                        json_resp(400, {"error": "Geef een geldig geheim en 6-cijferige code."})
+                    else:
+                        try:
+                            base64.b32decode(secret)   # valideer base32
+                            ok = _totp_verify(code, secret)
+                        except Exception:
+                            ok = False
+                        if ok:
+                            proxy_server.cfg.totp_secret = secret
+                            save_config(proxy_server.cfg, proxy_server.config_path)
+                            logger.info("TOTP geactiveerd")
+                            json_resp(200, {"ok": True})
+                        else:
+                            json_resp(400, {"error": "Code klopt niet bij dit geheim. Probeer opnieuw."})
+
+        elif method == "POST" and path == "/api/totp/disable":
+            if not authed:
+                json_resp(401, {"error": "Niet ingelogd."})
+            else:
+                proxy_server.cfg.totp_secret = ""
+                save_config(proxy_server.cfg, proxy_server.config_path)
+                logger.info("TOTP uitgeschakeld")
+                json_resp(200, {"ok": True})
+
+        elif method == "GET" and path == "/api/totp/status":
+            if not authed:
+                json_resp(401, {"error": "Niet ingelogd."})
+            else:
+                json_resp(200, {"enabled": bool(proxy_server.cfg.totp_secret)})
 
         # ── Beveiligde routes (sessie vereist) ────────────────────────────────
 
