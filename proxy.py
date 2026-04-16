@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import pty
+import re
 import secrets
 import signal
 import smtplib
@@ -67,7 +68,8 @@ MAX_OTP_ATTEMPTS = 10   # max foutieve pogingen voor code ongeldig wordt
 # In-memory auth state (asyncio single-threaded — geen locks nodig)
 _otp_store: dict[str, tuple[float, bool]] = {}   # code → (expires_at, used)
 _sessions:  dict[str, float]              = {}   # token → expires_at
-_last_code_ts: float                      = 0.0  # tijdstip laatste code-aanvraag
+_last_code_ts: float                      = 0.0  # tijdstip laatste code-aanvraag (globaal)
+_code_ts_per_ip: dict[str, float]         = {}   # ip → tijdstip laatste code-aanvraag
 _verify_attempts: int                     = 0    # foutieve verify-pogingen sinds laatste code
 
 # Alert-cooldowns (voorkomt spam bij aanhoudende backend-problemen)
@@ -319,6 +321,8 @@ def extract_sni(data: bytes) -> Optional[str]:
                     name_len  = struct.unpack("!H", data[pos + 3: pos + 5])[0]
                     if name_type == 0x00 and pos + 5 + name_len <= len(data):
                         return data[pos + 5: pos + 5 + name_len].decode("ascii")
+            if pos + ext_len > len(data):
+                return None
             pos += ext_len
         return None
     except Exception:
@@ -462,7 +466,7 @@ def _generate_otp() -> str:
     global _verify_attempts
     _cleanup_expired()
     _verify_attempts = 0
-    code = f"{secrets.randbelow(1_000_000):06d}"
+    code = f"{secrets.randbelow(100_000_000):08d}"
     _otp_store[code] = (time.time() + OTP_TTL, False)
     return code
 
@@ -743,6 +747,8 @@ async def _ws_read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
         length = struct.unpack('>H', await reader.readexactly(2))[0]
     elif length == 127:
         length = struct.unpack('>Q', await reader.readexactly(8))[0]
+    if length > 1_048_576:
+        raise ValueError(f"WebSocket frame too large: {length} bytes")
     mask = await reader.readexactly(4) if masked else b''
     payload = await reader.readexactly(length)
     if masked:
@@ -2122,7 +2128,7 @@ async def handle_admin(
                     json_resp(403, {"error": "Ongeldige of verlopen toegang."})
                 else:
                     allowed = proxy_server.cfg.telegram.allowed_chat_ids
-                    authorized = True
+                    authorized = False
                     if allowed:
                         try:
                             params = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
@@ -2150,7 +2156,9 @@ async def handle_admin(
         elif method == "POST" and path == "/api/auth/request-code":
             global _last_code_ts
             now = time.time()
-            remaining = CODE_COOLDOWN - (now - _last_code_ts)
+            client_ip = (writer.get_extra_info("peername") or ("?",))[0]
+            ip_last = _code_ts_per_ip.get(client_ip, 0.0)
+            remaining = CODE_COOLDOWN - (now - max(_last_code_ts, ip_last))
             if remaining > 0:
                 json_resp(429, {"error": f"Wacht nog {int(remaining)+1} seconden voor een nieuwe code."})
             elif not proxy_server.cfg.email.gmail_user and not proxy_server.cfg.telegram.bot_token:
@@ -2158,6 +2166,7 @@ async def handle_admin(
             else:
                 code = _generate_otp()
                 _last_code_ts = now
+                _code_ts_per_ip[client_ip] = now
                 sent_via = []
                 errors = []
                 if proxy_server.cfg.email.gmail_user:
@@ -2585,6 +2594,9 @@ async def _tg_cmd_cert(token: str, chat_id: int, cfg: "Config") -> None:
     })
 
 
+_SENSITIVE_LOG_RE = re.compile(r'password|passwd|secret|token|key\b', re.IGNORECASE)
+
+
 async def _tg_cmd_logs(token: str, chat_id: int) -> None:
     """Stuur de laatste 30 logregels."""
     result = await asyncio.to_thread(
@@ -2592,7 +2604,8 @@ async def _tg_cmd_logs(token: str, chat_id: int) -> None:
         ["journalctl", "-u", "py-proxy", "-n", "30", "--no-pager", "--output=short"],
         capture_output=True, text=True, timeout=10,
     )
-    text = result.stdout.strip() or "(geen logs)"
+    lines = [l for l in result.stdout.splitlines() if not _SENSITIVE_LOG_RE.search(l)]
+    text = "\n".join(lines).strip() or "(geen logs)"
     if len(text) > 3900:
         text = "…\n" + text[-3900:]
     await asyncio.to_thread(_tg_call, token, "sendMessage", {
