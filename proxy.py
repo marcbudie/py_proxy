@@ -1277,6 +1277,8 @@ ADMIN_HTML = """\
   td { padding: .75rem 1.2rem; border-top: 1px solid #f0f0f0; font-size: .9rem; vertical-align: middle; }
   tr:first-child td { border-top: none; }
   .host { font-family: monospace; font-size: .88rem; }
+  .host a { color: inherit; text-decoration: none; }
+  .host a:hover { color: #6366f1; text-decoration: underline; }
   .backend { color: #777; font-size: .82rem; font-family: monospace; }
   .route-stats { font-size: .76rem; margin-top: .15rem; color: #aaa; }
   .s-ok  { color: #16a34a; }
@@ -1427,7 +1429,7 @@ async function load() {
     const routes = await r.json();
     document.getElementById('tbody').innerHTML = routes.length ? routes.map(rt => `
       <tr>
-        <td class="host">${esc(rt.hostname)}</td>
+        <td class="host">${rt.enabled ? `<a href="https://${esc(rt.hostname)}" target="_blank" rel="noopener noreferrer">${esc(rt.hostname)}</a>` : esc(rt.hostname)}</td>
         <td class="backend">
           ${esc(rt.name)}
           <div class="route-stats">
