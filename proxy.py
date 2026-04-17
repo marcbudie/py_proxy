@@ -1500,6 +1500,7 @@ ADMIN_HTML = """\
   </div>
   <div style="display:flex;gap:.5rem">
     <button class="btn-term" onclick="openTerminal()">&#xbb; Terminal</button>
+    <button class="btn-logout" onclick="resetStats()" title="Verbindingstellers resetten">&#x21BA; Tellers</button>
     <button class="btn-logout" onclick="logout()">Uitloggen</button>
   </div>
 </div>
@@ -1705,6 +1706,13 @@ async function toggleTcp(port, el) {
 async function logout() {
   await fetch('/api/auth/logout', {method: 'POST'});
   window.location.href = '/login';
+}
+
+async function resetStats() {
+  if (!confirm('Verbindingstellers resetten?')) return;
+  const r = await fetch('/api/stats/clear', {method: 'POST'});
+  if (r.ok) { showMsg('Tellers gereset.', true); await load(); await loadTcp(); }
+  else showMsg('Resetten mislukt.', false);
 }
 
 async function disableTotp() {
@@ -2518,6 +2526,15 @@ async def handle_admin(
 
         elif method == "POST" and path == "/api/reload":
             proxy_server.reload()
+            json_resp(200, {"ok": True})
+
+        elif method == "POST" and path == "/api/stats/clear":
+            _stats["tls_ok"].clear()
+            _stats["tls_rej"].clear()
+            _stats["tcp_ok"].clear()
+            _stats["tcp_rej"].clear()
+            _stats["tls_unknown"] = 0
+            logger.info("Statistieken gereset via admin UI")
             json_resp(200, {"ok": True})
 
         elif method == "GET" and path == "/api/routes":
