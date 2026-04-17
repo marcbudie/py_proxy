@@ -2017,8 +2017,7 @@ MINI_APP_HTML = """\
 <div id="main"><div class="msg">Laden&#x2026;</div></div>
 <div class="bottom-bar">
   <div style="display:flex;gap:10px">
-    <button class="btn" id="btn-refresh" onclick="refresh()" style="flex:0 0 auto;width:48px;font-size:20px;padding:14px 0">&#x1F504;</button>
-    <button class="btn" id="btn-reload" onclick="reloadCfg()" style="flex:1">&#x21BA; Config herladen</button>
+    <button class="btn" id="btn-refresh" onclick="refresh()" style="flex:1;font-size:20px;padding:14px 0">&#x1F504;</button>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -2105,17 +2104,6 @@ async function refresh(){
   b.disabled=false;
 }
 
-async function reloadCfg(){
-  const b=document.getElementById('btn-reload');
-  b.disabled=true; b.textContent='Herladen\\u2026';
-  try{
-    const r=await fetch('/api/reload',{method:'POST'});
-    if(!r.ok)throw 0;
-    toast('\\u2705 Config herladen');
-    setTimeout(load,600);
-  }catch{toast('Herladen mislukt');}
-  b.disabled=false; b.textContent='\\u21BA Config herladen';
-}
 
 async function init(){
   if(!tg.initData){await load();startAutoRefresh();return;}
