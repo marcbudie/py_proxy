@@ -502,23 +502,33 @@ async def _tls_terminate_and_pipe(
     while True:
         try:
             chunk = ssl_obj.read(16384)
-            if chunk:
-                be_writer.write(_maybe_rewrite(chunk))
-                c_to_b += len(chunk)
-        except ssl.SSLWantReadError:
+            if not chunk:
+                break
+            be_writer.write(_maybe_rewrite(chunk))
+            c_to_b += len(chunk)
+        except (ssl.SSLWantReadError, ssl.SSLZeroReturnError):
             break
     if c_to_b:
         await be_writer.drain()
+    # Geef andere coroutines een kans na de synchrone handshake + drain.
+    await asyncio.sleep(0)
 
     client_task: asyncio.Task = asyncio.ensure_future(client_reader.read(16384))
     be_task:     asyncio.Task = asyncio.ensure_future(be_reader.read(16384))
+
+    # IDLE_TIMEOUT: sluit keep-alive verbindingen die te lang niets doen.
+    IDLE_TIMEOUT = 30.0
 
     try:
         while True:
             done, _ = await asyncio.wait(
                 [client_task, be_task],
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=IDLE_TIMEOUT,
             )
+            if not done:
+                # Timeout — geen activiteit, sluit de verbinding.
+                break
 
             if client_task in done:
                 encrypted = client_task.result()
@@ -528,12 +538,11 @@ async def _tls_terminate_and_pipe(
                 while True:
                     try:
                         plain = ssl_obj.read(16384)
-                        if plain:
-                            be_writer.write(_maybe_rewrite(plain))
-                            c_to_b += len(plain)
-                    except ssl.SSLWantReadError:
-                        break
-                    except ssl.SSLZeroReturnError:
+                        if not plain:
+                            break
+                        be_writer.write(_maybe_rewrite(plain))
+                        c_to_b += len(plain)
+                    except (ssl.SSLWantReadError, ssl.SSLZeroReturnError):
                         break
                 await be_writer.drain()
                 await flush_to_client()
