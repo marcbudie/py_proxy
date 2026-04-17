@@ -127,7 +127,26 @@ De admin UI (poort 9443) is niet direct open in de firewall — alleen bereikbaa
 }
 ```
 
-Elke TLS route stuurt verkeer voor dat hostname transparant door naar de opgegeven backend. TLS wordt niet getermineerd — het backend-certificaat blijft intact.
+Elke TLS route stuurt verkeer voor dat hostname transparant door naar de opgegeven backend. TLS wordt standaard niet getermineerd — het backend-certificaat blijft intact.
+
+### TLS termineren voor HTTP backends
+
+Voeg `"tls_terminate": true` toe aan een route als de backend plain HTTP draait (geen TLS):
+
+```json
+"mijnsite.nl": {
+  "host": "192.168.1.10", "port": 80, "name": "mijnsite",
+  "enabled": true, "tls_terminate": true
+}
+```
+
+De proxy termineert dan TLS aan de client-kant (met het wildcard-cert of een per-route cert) en stuurt de gedecrypte HTTP bytes door naar de backend. De browser ziet gewoon HTTPS; de backend hoeft geen cert te hebben.
+
+**Vereiste:** het hostname moet gedekt zijn door het globale wildcard-cert of een per-route `tls_cert`/`tls_key`.
+
+**Host-header rewrite:** de proxy herschrijft automatisch de `Host`-header naar het backend-adres (bijv. `192.168.2.254` of `192.168.2.254:8080`). Dit is nodig omdat veel apparaten (routers, NAS, etc.) requests weigeren met een externe hostnaam in de Host-header.
+
+In de admin UI staat bij "Route toevoegen" een checkbox "HTTP backend (TLS termineren)". Bestaande routes aanpassen: handmatig `"tls_terminate": true/false` in `config.json` zetten en daarna `systemctl reload py-proxy`.
 
 ### TCP routes
 
@@ -159,7 +178,7 @@ Functionaliteit:
 
 - **Aan/uit toggle** per TLS route en per TCP route — direct actief, opgeslagen in `config.json`
 - **Verwijderen** per TLS route — met bevestigingsdialoog
-- **Toevoegen** TLS route via formulier onderaan — velden: hostname, backend host, poort, label
+- **Toevoegen** TLS route via formulier onderaan — velden: hostname, backend host, poort, label, checkbox "HTTP backend (TLS termineren)"
 - Aparte TCP routes sectie met toggle per route
 
 Wijzigingen worden direct actief en opgeslagen in `config.json` zonder herstart.
@@ -206,7 +225,7 @@ TOTP uitschakelen: dashboard → "Authenticatie: Uitschakelen" — valt terug op
 | POST | `/api/totp/disable` | Deactiveer TOTP, valt terug op legacy OTP |
 | GET | `/api/totp/status` | Geeft `{"enabled": bool}` |
 | GET | `/api/routes` | Lijst van alle TLS routes |
-| POST | `/api/routes` | Nieuwe TLS route toevoegen (JSON body: `hostname`, `host`, `port`, `name`) |
+| POST | `/api/routes` | Nieuwe TLS route toevoegen (JSON body: `hostname`, `host`, `port`, `name`, optioneel `tls_terminate`) |
 | POST | `/api/routes/<hostname>/toggle` | TLS route aan/uit schakelen |
 | DELETE | `/api/routes/<hostname>` | TLS route verwijderen |
 | GET | `/api/tcp-routes` | Lijst van alle TCP routes |

@@ -141,7 +141,8 @@ class Backend:
     enabled: bool = True
     tls_cert: Optional[str] = None
     tls_key:  Optional[str] = None
-    notify:   bool = False          # stuur Telegram-bericht bij elke verbinding
+    notify:        bool = False          # stuur Telegram-bericht bij elke verbinding
+    tls_terminate: bool = False          # termineer TLS en stuur plain HTTP door naar backend
 
 
 @dataclass
@@ -178,6 +179,7 @@ def _parse_backend(d: dict) -> Backend:
         tls_cert=d.get("tls_cert"),
         tls_key=d.get("tls_key"),
         notify=d.get("notify", False),
+        tls_terminate=d.get("tls_terminate", False),
     )
 
 
@@ -234,6 +236,7 @@ def save_config(cfg: Config, path: Path) -> None:
                 "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
                 "tls_cert": b.tls_cert, "tls_key": b.tls_key,
                 "notify": b.notify or None,
+                "tls_terminate": b.tls_terminate or None,
             }.items() if v is not None or k in ("host", "port", "name", "enabled")}
             for h, b in cfg.tls_routes.items()
         },
@@ -431,6 +434,133 @@ async def send_tls_error_page(
         await flush()
     except Exception:
         pass
+
+
+def _rewrite_host_header(data: bytes, new_host: str) -> bytes:
+    """Vervang de Host-header in het eerste HTTP-verzoek (eenmalig)."""
+    return re.sub(
+        rb'(?i)Host:[ \t]*[^\r\n]+\r\n',
+        b'Host: ' + new_host.encode('ascii') + b'\r\n',
+        data, count=1,
+    )
+
+
+async def _tls_terminate_and_pipe(
+    initial: bytes,
+    client_reader: asyncio.StreamReader,
+    client_writer: asyncio.StreamWriter,
+    ssl_ctx: ssl.SSLContext,
+    be_reader: asyncio.StreamReader,
+    be_writer: asyncio.StreamWriter,
+    backend_host: str = "",
+) -> tuple[int, int]:
+    """Termineer TLS aan de client-kant en pip plain bytes naar/van de backend.
+    Als backend_host opgegeven is, wordt de Host-header herschreven."""
+    incoming = ssl.MemoryBIO()
+    outgoing = ssl.MemoryBIO()
+    ssl_obj = ssl_ctx.wrap_bio(incoming, outgoing, server_side=True)
+    incoming.write(initial)
+
+    async def flush_to_client() -> None:
+        if outgoing.pending:
+            client_writer.write(outgoing.read())
+            await client_writer.drain()
+
+    # TLS handshake
+    try:
+        while True:
+            try:
+                ssl_obj.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                await flush_to_client()
+                more = await asyncio.wait_for(client_reader.read(16384), timeout=10)
+                if not more:
+                    return 0, 0
+                incoming.write(more)
+            except ssl.SSLWantWriteError:
+                await flush_to_client()
+        await flush_to_client()
+    except Exception:
+        return 0, 0
+
+    # Bidirectioneel pipen via event-loop tasks
+    c_to_b = 0
+    b_to_c = 0
+    _host_rewritten = False
+
+    def _maybe_rewrite(data: bytes) -> bytes:
+        nonlocal _host_rewritten
+        if backend_host and not _host_rewritten:
+            _host_rewritten = True
+            return _rewrite_host_header(data, backend_host)
+        return data
+
+    # Na de handshake kan er al application data in de MemoryBIO zitten
+    # (browser stuurt HTTP-request vaak in hetzelfde TLS-blok als Finished).
+    # Drain dit nu direct naar de backend.
+    while True:
+        try:
+            chunk = ssl_obj.read(16384)
+            if chunk:
+                be_writer.write(_maybe_rewrite(chunk))
+                c_to_b += len(chunk)
+        except ssl.SSLWantReadError:
+            break
+    if c_to_b:
+        await be_writer.drain()
+
+    client_task: asyncio.Task = asyncio.ensure_future(client_reader.read(16384))
+    be_task:     asyncio.Task = asyncio.ensure_future(be_reader.read(16384))
+
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                [client_task, be_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if client_task in done:
+                encrypted = client_task.result()
+                if not encrypted:
+                    break
+                incoming.write(encrypted)
+                while True:
+                    try:
+                        plain = ssl_obj.read(16384)
+                        if plain:
+                            be_writer.write(_maybe_rewrite(plain))
+                            c_to_b += len(plain)
+                    except ssl.SSLWantReadError:
+                        break
+                    except ssl.SSLZeroReturnError:
+                        break
+                await be_writer.drain()
+                await flush_to_client()
+                client_task = asyncio.ensure_future(client_reader.read(16384))
+
+            if be_task in done:
+                plain = be_task.result()
+                if not plain:
+                    try:
+                        ssl_obj.unwrap()
+                        await flush_to_client()
+                    except Exception:
+                        pass
+                    break
+                try:
+                    ssl_obj.write(plain)
+                    b_to_c += len(plain)
+                    await flush_to_client()
+                except ssl.SSLError:
+                    break
+                be_task = asyncio.ensure_future(be_reader.read(16384))
+    finally:
+        for t in (client_task, be_task):
+            if not t.done():
+                t.cancel()
+
+    return c_to_b, b_to_c
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -704,13 +834,23 @@ async def handle_connection(
         if backend.notify and cfg.telegram.bot_token:
             asyncio.create_task(_tg_notify_connect(sni, backend, src, cfg))
 
-        be_writer.write(initial)
-        await be_writer.drain()
-
-        up, down = await asyncio.gather(
-            pipe(client_reader, be_writer, f"{src}→{backend.name}"),
-            pipe(be_reader, client_writer, f"{backend.name}→{src}"),
-        )
+        if backend.tls_terminate:
+            ssl_ctx = server._ssl_ctx_for(backend)
+            if not ssl_ctx:
+                logger.error(f"[{src}] tls_terminate=True maar geen cert beschikbaar voor {sni}")
+                return
+            be_host_hdr = backend.host if backend.port == 80 else f"{backend.host}:{backend.port}"
+            up, down = await _tls_terminate_and_pipe(
+                initial, client_reader, client_writer, ssl_ctx, be_reader, be_writer,
+                backend_host=be_host_hdr,
+            )
+        else:
+            be_writer.write(initial)
+            await be_writer.drain()
+            up, down = await asyncio.gather(
+                pipe(client_reader, be_writer, f"{src}→{backend.name}"),
+                pipe(be_reader, client_writer, f"{backend.name}→{src}"),
+            )
 
         elapsed = time.monotonic() - started
         logger.info(
@@ -1416,6 +1556,10 @@ ADMIN_HTML = """\
     <input id="f-port"     placeholder="poort" type="number" min="1" max="65535" autocomplete="off">
     <input id="f-name"     placeholder="label" autocomplete="off">
   </div>
+  <label style="display:flex;align-items:center;gap:.5rem;font-size:.88rem;color:#555;margin:.75rem 0">
+    <input type="checkbox" id="f-tls-terminate">
+    HTTP backend (TLS termineren — proxy ontsleutelt TLS, stuurt plain HTTP door)
+  </label>
   <button class="btn-add" onclick="addRoute()">Toevoegen</button>
 </div>
 
@@ -1431,7 +1575,7 @@ async function load() {
       <tr>
         <td class="host">${rt.enabled ? `<a href="https://${esc(rt.hostname)}" target="_blank" rel="noopener noreferrer">${esc(rt.hostname)}</a>` : esc(rt.hostname)}</td>
         <td class="backend">
-          ${esc(rt.name)}
+          ${esc(rt.name)}${rt.tls_terminate ? ' <span style="font-size:.75rem;background:#e0f2fe;color:#0369a1;border-radius:4px;padding:1px 5px;vertical-align:middle">HTTP</span>' : ''}
           <div class="route-stats">
             <span class="s-ok">${rt.ok} verbindingen</span>${rt.rejected ? ` &middot; <span class="s-rej">${rt.rejected} geweigerd</span>` : ''}
           </div>
@@ -1479,16 +1623,17 @@ async function remove(hostname) {
 }
 
 async function addRoute() {
-  const hostname = document.getElementById('f-hostname').value.trim().toLowerCase();
-  const host     = document.getElementById('f-host').value.trim();
-  const port     = parseInt(document.getElementById('f-port').value, 10);
-  const name     = document.getElementById('f-name').value.trim();
+  const hostname     = document.getElementById('f-hostname').value.trim().toLowerCase();
+  const host         = document.getElementById('f-host').value.trim();
+  const port         = parseInt(document.getElementById('f-port').value, 10);
+  const name         = document.getElementById('f-name').value.trim();
+  const tls_terminate = document.getElementById('f-tls-terminate').checked;
   if (!hostname || !host || !port || !name) { showMsg('Vul alle velden in.', false); return; }
   try {
     const r = await fetch('/api/routes', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({hostname, host, port, name}),
+      body: JSON.stringify({hostname, host, port, name, tls_terminate}),
     });
     if (r.status === 401) { window.location.href = '/login'; return; }
     if (!r.ok) {
@@ -1501,6 +1646,7 @@ async function addRoute() {
     document.getElementById('f-host').value = '';
     document.getElementById('f-port').value = '';
     document.getElementById('f-name').value = '';
+    document.getElementById('f-tls-terminate').checked = false;
     await load();
   } catch (e) { showMsg('Netwerkfout: ' + e, false); }
 }
@@ -2368,6 +2514,7 @@ async def handle_admin(
         elif method == "GET" and path == "/api/routes":
             routes = [
                 {"hostname": h, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
+                 "tls_terminate": b.tls_terminate,
                  "ok": _stats["tls_ok"].get(h, 0), "rejected": _stats["tls_rej"].get(h, 0)}
                 for h, b in proxy_server.cfg.tls_routes.items()
             ]
@@ -2376,10 +2523,11 @@ async def handle_admin(
         elif method == "POST" and path == "/api/routes":
             try:
                 data = json.loads(body)
-                hostname = data["hostname"].strip().lower()
-                host     = data["host"].strip()
-                port     = int(data["port"])
-                name     = data["name"].strip()
+                hostname      = data["hostname"].strip().lower()
+                host          = data["host"].strip()
+                port          = int(data["port"])
+                name          = data["name"].strip()
+                tls_terminate = bool(data.get("tls_terminate", False))
                 if not hostname or not host or not name or not (1 <= port <= 65535):
                     raise ValueError("invalid fields")
             except Exception:
@@ -2388,7 +2536,9 @@ async def handle_admin(
                 if hostname in proxy_server.cfg.tls_routes:
                     json_resp(400, {"error": "Hostname bestaat al."})
                 else:
-                    proxy_server.cfg.tls_routes[hostname] = Backend(host=host, port=port, name=name)
+                    proxy_server.cfg.tls_routes[hostname] = Backend(
+                        host=host, port=port, name=name, tls_terminate=tls_terminate,
+                    )
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     logger.info(f"Route {hostname} → {name} ({host}:{port}) toegevoegd via admin UI")
                     json_resp(200, {"hostname": hostname})
@@ -3026,7 +3176,7 @@ class ProxyServer:
                 allowed    = self.cfg.telegram.allowed_chat_ids
                 result     = await asyncio.to_thread(
                     _tg_call, token, "getUpdates",
-                    {"offset": offset, "timeout": 30}, 35,
+                    {"offset": offset, "timeout": 5}, 10,
                 )
                 for update in result.get("result", []):
                     offset = update["update_id"] + 1
