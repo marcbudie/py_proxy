@@ -922,9 +922,9 @@ def _make_login_html(totp_enabled: bool) -> str:
   <!-- Legacy OTP modus: stap 2 = code invoeren -->
   <div id="step2" class="step">
     <p style="color:#555;font-size:.88rem;margin-bottom:1.25rem">
-      Er is een 6-cijferige code verstuurd.<br>De code is 5 minuten geldig.
+      Er is een 8-cijferige code verstuurd.<br>De code is 5 minuten geldig.
     </p>
-    <input id="codeInput" type="text" maxlength="6" placeholder="000000"
+    <input id="codeInput" type="text" maxlength="8" placeholder="00000000"
            oninput="this.value=this.value.replace(/[^0-9]/g,'')"
            onkeydown="if(event.key==='Enter')verifyCode()">
     <button id="btnVerify" onclick="verifyCode()">Inloggen</button>
@@ -987,7 +987,7 @@ async function requestCode() {
 }
 async function verifyCode() {
   const code = document.getElementById('codeInput').value.trim();
-  if (code.length !== 6) { setMsg('msg2', 'Voer een 6-cijferige code in.', false); return; }
+  if (code.length !== 8) { setMsg('msg2', 'Voer een 8-cijferige code in.', false); return; }
   const btn = document.getElementById('btnVerify');
   btn.disabled = true; btn.textContent = 'Controleren\u2026';
   try {
