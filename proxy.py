@@ -1399,8 +1399,9 @@ ADMIN_HTML = """\
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #f0f2f5; padding: 2rem; color: #222; }
-  .topbar { display: flex; align-items: center; justify-content: space-between;
-            max-width: 800px; margin-bottom: 1.5rem; }
+  .topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+            max-width: 800px; margin-bottom: 1.5rem; gap: .6rem; }
+  .topbar-btns { display: flex; gap: .5rem; flex-wrap: wrap; }
   h1 { font-size: 1.4rem; font-weight: 600; }
   .btn-logout { background: none; border: 1px solid #d1d5db; color: #555;
                 border-radius: 6px; padding: .3rem .8rem; font-size: .82rem;
@@ -1498,7 +1499,7 @@ ADMIN_HTML = """\
     """ + _LOGO_32 + """
     <h1>SNI Proxy</h1>
   </div>
-  <div style="display:flex;gap:.5rem">
+  <div class="topbar-btns">
     <button class="btn-term" onclick="openTerminal()">&#xbb; Terminal</button>
     <button class="btn-logout" onclick="resetStats()" title="Verbindingstellers resetten">&#x21BA; Tellers</button>
     <button class="btn-logout" onclick="logout()">Uitloggen</button>
@@ -1711,7 +1712,7 @@ async function logout() {
 async function resetStats() {
   if (!confirm('Verbindingstellers resetten?')) return;
   const r = await fetch('/api/stats/clear', {method: 'POST'});
-  if (r.ok) { showMsg('Tellers gereset.', true); await load(); await loadTcp(); }
+  if (r.ok) { showMsg('Tellers gereset.', true); await load(); await loadTcp(); await loadStats(); }
   else showMsg('Resetten mislukt.', false);
 }
 
