@@ -107,7 +107,8 @@ De admin UI (poort 9443) is niet direct open in de firewall — alleen bereikbaa
     }
   },
   "tcp_routes": {
-    "2222": {"host": "192.168.1.10", "port": 22, "name": "ssh", "enabled": true}
+    "2222": {"host": "192.168.1.10", "port": 22, "name": "ssh", "enabled": true,
+             "auto_disable_minutes": 0}
   },
   "connect_timeout": 10,
   "read_timeout": 5,
@@ -149,6 +150,19 @@ De proxy termineert dan TLS aan de client-kant (met het wildcard-cert of een per
 **Keep-alive / idle timeout:** verbindingen zonder activiteit worden na 30 seconden gesloten. Dit voorkomt dat trage of idle HTTP/1.1 keep-alive verbindingen de event loop belasten. Pagina's die veel resources laden (zoals Flutter web apps) openen tientallen gelijktijdige verbindingen — dit wordt correct afgehandeld.
 
 In de admin UI staat bij "Route toevoegen" een checkbox "HTTP backend (TLS termineren)". Bestaande routes aanpassen: handmatig `"tls_terminate": true/false` in `config.json` zetten en daarna `systemctl reload py-proxy`.
+
+### Auto-uitschakelen
+
+Voeg `"auto_disable_minutes": N` toe aan een route om hem automatisch uit te schakelen N minuten nadat hij is ingeschakeld. `0` (standaard) betekent nooit automatisch uitschakelen.
+
+```json
+"tijdelijke.nl": {
+  "host": "192.168.1.10", "port": 443, "name": "tijdelijk",
+  "enabled": true, "auto_disable_minutes": 10
+}
+```
+
+Werkt voor zowel TLS- als TCP-routes. De timer start op het moment van inschakelen (via toggle in de UI, Telegram of direct in config). De background task controleert elke 15 seconden; bij auto-uitschakelen wordt een Telegram-melding verstuurd (⏱ Auto-uitgeschakeld). De admin UI toont een oranje afteltimer per route en ververst de tabellen elke 15 seconden automatisch.
 
 ### TCP routes
 
@@ -229,9 +243,11 @@ TOTP uitschakelen: dashboard → "Authenticatie: Uitschakelen" — valt terug op
 | GET | `/api/routes` | Lijst van alle TLS routes |
 | POST | `/api/routes` | Nieuwe TLS route toevoegen (JSON body: `hostname`, `host`, `port`, `name`, optioneel `tls_terminate`) |
 | POST | `/api/routes/<hostname>/toggle` | TLS route aan/uit schakelen |
+| POST | `/api/routes/<hostname>/auto-disable` | Auto-uitschakelen instellen (body: `{"minutes": N}`) |
 | DELETE | `/api/routes/<hostname>` | TLS route verwijderen |
 | GET | `/api/tcp-routes` | Lijst van alle TCP routes |
 | POST | `/api/tcp-routes/<port>/toggle` | TCP route aan/uit schakelen |
+| POST | `/api/tcp-routes/<port>/auto-disable` | Auto-uitschakelen instellen (body: `{"minutes": N}`) |
 
 ## Telegram bot
 
