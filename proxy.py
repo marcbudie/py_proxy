@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -143,6 +143,8 @@ class Backend:
     tls_key:  Optional[str] = None
     notify:        bool = False          # stuur Telegram-bericht bij elke verbinding
     tls_terminate: bool = False          # termineer TLS en stuur plain HTTP door naar backend
+    auto_disable_minutes: int = 0       # minuten tot auto-uitschakelen na inschakelen (0 = nooit)
+    enabled_until: Optional[float] = field(default=None, repr=False)  # runtime, niet opgeslagen
 
 
 @dataclass
@@ -180,6 +182,7 @@ def _parse_backend(d: dict) -> Backend:
         tls_key=d.get("tls_key"),
         notify=d.get("notify", False),
         tls_terminate=d.get("tls_terminate", False),
+        auto_disable_minutes=int(d.get("auto_disable_minutes", 0)),
     )
 
 
@@ -237,6 +240,7 @@ def save_config(cfg: Config, path: Path) -> None:
                 "tls_cert": b.tls_cert, "tls_key": b.tls_key,
                 "notify": b.notify or None,
                 "tls_terminate": b.tls_terminate or None,
+                "auto_disable_minutes": b.auto_disable_minutes or None,
             }.items() if v is not None or k in ("host", "port", "name", "enabled")}
             for h, b in cfg.tls_routes.items()
         },
@@ -252,7 +256,10 @@ def save_config(cfg: Config, path: Path) -> None:
             "to": cfg.email.to,
         },
         "tcp_routes": {
-            str(p): {"host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled}
+            str(p): {k: v for k, v in {
+                "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
+                "auto_disable_minutes": b.auto_disable_minutes or None,
+            }.items() if v is not None or k in ("host", "port", "name", "enabled")}
             for p, b in cfg.tcp_routes.items()
         },
         "telegram": {
@@ -1483,7 +1490,8 @@ ADMIN_HTML = """\
          padding: .75rem 1rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
     td { display: block; border: none !important; padding: .15rem 0; }
     td:nth-child(3) { display: none; }
-    td:nth-child(4), td:nth-child(5) { display: inline-block; vertical-align: middle;
+    td:nth-child(4) { display: none; }
+    td:nth-child(5), td:nth-child(6) { display: inline-block; vertical-align: middle;
                                         margin-right: .5rem; margin-top: .5rem; }
     .add-card { padding: 1rem; }
     .fields { grid-template-columns: 1fr; }
@@ -1528,12 +1536,13 @@ ADMIN_HTML = """\
       <th>Hostname</th>
       <th>Naam</th>
       <th>Status</th>
+      <th>Auto-uit</th>
       <th>Aan / Uit</th>
       <th></th>
     </tr>
   </thead>
   <tbody id="tbody">
-    <tr><td colspan="5" style="color:#aaa;padding:1.5rem">Laden&hellip;</td></tr>
+    <tr><td colspan="6" style="color:#aaa;padding:1.5rem">Laden&hellip;</td></tr>
   </tbody>
 </table>
 
@@ -1544,11 +1553,12 @@ ADMIN_HTML = """\
       <th>Luisterpoort</th>
       <th>Naam</th>
       <th>Status</th>
+      <th>Auto-uit</th>
       <th>Aan / Uit</th>
     </tr>
   </thead>
   <tbody id="tcp-tbody">
-    <tr><td colspan="4" style="color:#aaa;padding:1.5rem">Laden&hellip;</td></tr>
+    <tr><td colspan="5" style="color:#aaa;padding:1.5rem">Laden&hellip;</td></tr>
   </tbody>
 </table>
 
@@ -1592,6 +1602,14 @@ async function load() {
           </div>
         </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
+        <td style="white-space:nowrap">
+          <input type="number" min="0" style="width:4rem;padding:2px 4px;border:1px solid #ccc;border-radius:4px;font-size:.85rem"
+                 value="${rt.auto_disable_minutes}"
+                 title="Minuten tot auto-uitschakelen (0 = nooit)"
+                 onchange='setAutoDisable(${JSON.stringify(rt.hostname)}, this.value, "tls")'>
+          <span style="font-size:.8rem;color:#888">min</span>
+          ${rt.enabled_until ? `<div style="font-size:.75rem;color:#e06000" id="cd-tls-${esc(rt.hostname)}"></div>` : ''}
+        </td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
             <input type="checkbox" ${rt.enabled ? 'checked' : ''}
@@ -1601,7 +1619,10 @@ async function load() {
         </td>
         <td><button class="btn-del" onclick='remove(${JSON.stringify(rt.hostname)})'>Verwijder</button></td>
       </tr>
-    `).join('') : '<tr><td colspan="5" style="color:#aaa;padding:1.5rem">Geen routes geconfigureerd.</td></tr>';
+    `).join('') : '<tr><td colspan="6" style="color:#aaa;padding:1.5rem">Geen routes geconfigureerd.</td></tr>';
+    routes.forEach(rt => {
+      if (rt.enabled_until) _startCountdown('cd-tls-' + rt.hostname, rt.enabled_until);
+    });
   } catch (e) {
     showMsg('Kon routes niet laden: ' + e, false);
   }
@@ -1677,6 +1698,14 @@ async function loadTcp() {
           </div>
         </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
+        <td style="white-space:nowrap">
+          <input type="number" min="0" style="width:4rem;padding:2px 4px;border:1px solid #ccc;border-radius:4px;font-size:.85rem"
+                 value="${rt.auto_disable_minutes}"
+                 title="Minuten tot auto-uitschakelen (0 = nooit)"
+                 onchange='setAutoDisable(${rt.listen_port}, this.value, "tcp")'>
+          <span style="font-size:.8rem;color:#888">min</span>
+          ${rt.enabled_until ? `<div style="font-size:.75rem;color:#e06000" id="cd-tcp-${rt.listen_port}"></div>` : ''}
+        </td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
             <input type="checkbox" ${rt.enabled ? 'checked' : ''}
@@ -1685,7 +1714,10 @@ async function loadTcp() {
           </label>
         </td>
       </tr>
-    `).join('') : '<tr><td colspan="4" style="color:#aaa;padding:1.5rem">Geen TCP routes geconfigureerd.</td></tr>';
+    `).join('') : '<tr><td colspan="5" style="color:#aaa;padding:1.5rem">Geen TCP routes geconfigureerd.</td></tr>';
+    routes.forEach(rt => {
+      if (rt.enabled_until) _startCountdown('cd-tcp-' + rt.listen_port, rt.enabled_until);
+    });
   } catch (e) { showMsg('Kon TCP routes niet laden: ' + e, false); }
 }
 
@@ -1702,6 +1734,34 @@ async function toggleTcp(port, el) {
     el.checked = !el.checked;
     showMsg('Netwerkfout: ' + e, false);
   } finally { el.disabled = false; }
+}
+
+async function setAutoDisable(id, val, type) {
+  const minutes = parseInt(val, 10);
+  if (isNaN(minutes) || minutes < 0) return;
+  const url = type === 'tls'
+    ? '/api/routes/' + encodeURIComponent(id) + '/auto-disable'
+    : '/api/tcp-routes/' + id + '/auto-disable';
+  try {
+    const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({minutes})});
+    if (!r.ok) { showMsg('Fout bij instellen auto-disable.', false); return; }
+    showMsg(`Auto-uitschakelen ingesteld op ${minutes} min.`, true);
+    if (type === 'tls') await load(); else await loadTcp();
+  } catch (e) { showMsg('Netwerkfout: ' + e, false); }
+}
+
+const _cdTimers = {};
+function _startCountdown(elId, until) {
+  if (_cdTimers[elId]) clearInterval(_cdTimers[elId]);
+  _cdTimers[elId] = setInterval(() => {
+    const el = document.getElementById(elId);
+    if (!el) { clearInterval(_cdTimers[elId]); return; }
+    const rem = Math.max(0, Math.round(until - Date.now() / 1000));
+    const m = Math.floor(rem / 60), s = rem % 60;
+    el.textContent = `Uit over ${m}:${String(s).padStart(2,'0')}`;
+    if (rem === 0) clearInterval(_cdTimers[elId]);
+  }, 1000);
 }
 
 async function logout() {
@@ -1783,6 +1843,7 @@ load();
 loadTcp();
 loadStats();
 setInterval(loadStats, 15000);
+setInterval(() => { load(); loadTcp(); }, 15000);
 
 // ── Terminal ──────────────────────────────────────────────────────────────────
 let _termWs = null, _termObj = null;
@@ -2530,6 +2591,8 @@ async def handle_admin(
             routes = [
                 {"hostname": h, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
                  "tls_terminate": b.tls_terminate,
+                 "auto_disable_minutes": b.auto_disable_minutes,
+                 "enabled_until": b.enabled_until,
                  "ok": _stats["tls_ok"].get(h, 0), "rejected": _stats["tls_rej"].get(h, 0)}
                 for h, b in proxy_server.cfg.tls_routes.items()
             ]
@@ -2568,6 +2631,58 @@ async def handle_admin(
                 logger.info(f"Route {hostname} verwijderd via admin UI")
                 json_resp(200, {"hostname": hostname})
 
+        elif method == "POST" and path.startswith("/api/routes/") and path.endswith("/auto-disable"):
+            segments = path.strip("/").split("/")
+            if len(segments) == 4:
+                hostname = urllib.parse.unquote(segments[2])
+                backend  = proxy_server.cfg.tls_routes.get(hostname)
+                if backend is None:
+                    json_resp(404, {"error": "Route niet gevonden."})
+                else:
+                    try:
+                        minutes = int(json.loads(body).get("minutes", 0))
+                        if minutes < 0:
+                            raise ValueError
+                    except Exception:
+                        json_resp(400, {"error": "Ongeldige waarde voor minutes."})
+                    else:
+                        backend.auto_disable_minutes = minutes
+                        if backend.enabled and minutes > 0 and backend.enabled_until is None:
+                            backend.enabled_until = time.time() + minutes * 60
+                        elif minutes == 0:
+                            backend.enabled_until = None
+                        save_config(proxy_server.cfg, proxy_server.config_path)
+                        json_resp(200, {"hostname": hostname, "auto_disable_minutes": minutes,
+                                        "enabled_until": backend.enabled_until})
+            else:
+                json_resp(400, {"error": "Ongeldig verzoek."})
+
+        elif method == "POST" and path.startswith("/api/tcp-routes/") and path.endswith("/auto-disable"):
+            try:
+                listen_port = int(path.strip("/").split("/")[2])
+            except (ValueError, IndexError):
+                json_resp(400, {"error": "Ongeldige poort."})
+            else:
+                backend = proxy_server.cfg.tcp_routes.get(listen_port)
+                if backend is None:
+                    json_resp(404, {"error": "TCP route niet gevonden."})
+                else:
+                    try:
+                        minutes = int(json.loads(body).get("minutes", 0))
+                        if minutes < 0:
+                            raise ValueError
+                    except Exception:
+                        json_resp(400, {"error": "Ongeldige waarde voor minutes."})
+                    else:
+                        backend.auto_disable_minutes = minutes
+                        if backend.enabled and minutes > 0 and backend.enabled_until is None:
+                            backend.enabled_until = time.time() + minutes * 60
+                        elif minutes == 0:
+                            backend.enabled_until = None
+                        save_config(proxy_server.cfg, proxy_server.config_path)
+                        json_resp(200, {"listen_port": listen_port, "auto_disable_minutes": minutes,
+                                        "enabled_until": backend.enabled_until})
+
         elif method == "POST" and path.startswith("/api/routes/") and path.endswith("/toggle"):
             segments = path.strip("/").split("/")
             if len(segments) == 4 and segments[0] == "api" and segments[1] == "routes":
@@ -2577,16 +2692,23 @@ async def handle_admin(
                     json_resp(404, {"error": "Route niet gevonden."})
                 else:
                     backend.enabled = not backend.enabled
+                    if backend.enabled and backend.auto_disable_minutes > 0:
+                        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
+                    else:
+                        backend.enabled_until = None
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"Route {hostname} {state} via admin UI")
-                    json_resp(200, {"hostname": hostname, "enabled": backend.enabled})
+                    json_resp(200, {"hostname": hostname, "enabled": backend.enabled,
+                                    "enabled_until": backend.enabled_until})
             else:
                 json_resp(400, {"error": "Ongeldig verzoek."})
 
         elif method == "GET" and path == "/api/tcp-routes":
             routes = [
                 {"listen_port": p, "host": b.host, "port": b.port, "name": b.name, "enabled": b.enabled,
+                 "auto_disable_minutes": b.auto_disable_minutes,
+                 "enabled_until": b.enabled_until,
                  "ok": _stats["tcp_ok"].get(b.name, 0), "rejected": _stats["tcp_rej"].get(b.name, 0)}
                 for p, b in proxy_server.cfg.tcp_routes.items()
             ]
@@ -2603,10 +2725,15 @@ async def handle_admin(
                     json_resp(404, {"error": "TCP route niet gevonden."})
                 else:
                     backend.enabled = not backend.enabled
+                    if backend.enabled and backend.auto_disable_minutes > 0:
+                        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
+                    else:
+                        backend.enabled_until = None
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"TCP route :{listen_port} {state} via admin UI")
-                    json_resp(200, {"listen_port": listen_port, "enabled": backend.enabled})
+                    json_resp(200, {"listen_port": listen_port, "enabled": backend.enabled,
+                                    "enabled_until": backend.enabled_until})
 
         else:
             respond(404, "text/plain", b"Not found")
@@ -3110,6 +3237,7 @@ class ProxyServer:
             logger.info("Telegram bot niet geconfigureerd (geen bot_token in config.json)")
 
         asyncio.create_task(self._cleanup_task_loop())
+        asyncio.create_task(self._auto_disable_task_loop())
         await asyncio.gather(*(srv.serve_forever() for srv in self._servers))
 
     async def _cleanup_task_loop(self) -> None:
@@ -3117,6 +3245,35 @@ class ProxyServer:
         while True:
             await asyncio.sleep(60)
             _cleanup_expired()
+
+    async def _auto_disable_task_loop(self) -> None:
+        """Schakel routes uit die hun auto_disable timer hebben overschreden."""
+        while True:
+            await asyncio.sleep(15)
+            try:
+                now = time.time()
+                disabled: list[str] = []
+                for hostname, backend in self.cfg.tls_routes.items():
+                    if backend.enabled and backend.enabled_until is not None and now >= backend.enabled_until:
+                        backend.enabled = False
+                        backend.enabled_until = None
+                        disabled.append(f"TLS:{hostname}")
+                        logger.info(f"Route {hostname} automatisch uitgeschakeld (auto_disable_minutes={backend.auto_disable_minutes})")
+                for port, backend in self.cfg.tcp_routes.items():
+                    if backend.enabled and backend.enabled_until is not None and now >= backend.enabled_until:
+                        backend.enabled = False
+                        backend.enabled_until = None
+                        disabled.append(f"TCP:{port}")
+                        logger.info(f"TCP route :{port} automatisch uitgeschakeld (auto_disable_minutes={backend.auto_disable_minutes})")
+                if disabled:
+                    save_config(self.cfg, self.config_path)
+                    token = self.cfg.telegram.bot_token
+                    if token:
+                        names = ", ".join(disabled)
+                        await _tg_broadcast(token, self.cfg.telegram.allowed_chat_ids,
+                                            f"⏱ <b>Auto-uitgeschakeld</b>: {names}")
+            except Exception as exc:
+                logger.warning(f"_auto_disable_task_loop fout: {exc}")
 
     async def _daily_task_loop(self) -> None:
         """Dagelijks om 08:00 UTC: stuur statussamenvatting en check cert-vervaldatums."""
