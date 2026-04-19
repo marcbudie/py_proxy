@@ -2268,6 +2268,15 @@ async def handle_tcp_connection(
             pass
 
 
+def _apply_toggle(backend: Backend) -> None:
+    """Toggle backend.enabled en zet/wis enabled_until conform auto_disable_minutes."""
+    backend.enabled = not backend.enabled
+    if backend.enabled and backend.auto_disable_minutes > 0:
+        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
+    else:
+        backend.enabled_until = None
+
+
 async def handle_admin(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -2723,11 +2732,7 @@ async def handle_admin(
                 if backend is None:
                     json_resp(404, {"error": "Route niet gevonden."})
                 else:
-                    backend.enabled = not backend.enabled
-                    if backend.enabled and backend.auto_disable_minutes > 0:
-                        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
-                    else:
-                        backend.enabled_until = None
+                    _apply_toggle(backend)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"Route {hostname} {state} via admin UI")
@@ -2756,11 +2761,7 @@ async def handle_admin(
                 if backend is None:
                     json_resp(404, {"error": "TCP route niet gevonden."})
                 else:
-                    backend.enabled = not backend.enabled
-                    if backend.enabled and backend.auto_disable_minutes > 0:
-                        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
-                    else:
-                        backend.enabled_until = None
+                    _apply_toggle(backend)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"TCP route :{listen_port} {state} via admin UI")
@@ -3066,7 +3067,9 @@ async def _tg_handle_message(
                 "chat_id": chat_id, "text": "⚠️ Route proxy.budie.eu niet gevonden in config.",
             })
         else:
-            backend.enabled = command == "/proxyaan"
+            new_enabled = command == "/proxyaan"
+            if backend.enabled != new_enabled:
+                _apply_toggle(backend)
             save_config(proxy.cfg, proxy.config_path)
             state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
             icon  = "✅" if backend.enabled else "❌"
@@ -3101,7 +3104,7 @@ async def _tg_handle_callback(
             await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
                                     {"callback_query_id": cb_id, "text": "Route niet gevonden"})
             return
-        backend.enabled = not backend.enabled
+        _apply_toggle(backend)
         save_config(proxy.cfg, proxy.config_path)
         state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
         logger.info(f"Telegram: TLS route {hostname} {state}")
@@ -3117,7 +3120,7 @@ async def _tg_handle_callback(
             await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
                                     {"callback_query_id": cb_id, "text": "TCP route niet gevonden"})
             return
-        backend.enabled = not backend.enabled
+        _apply_toggle(backend)
         save_config(proxy.cfg, proxy.config_path)
         state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
         logger.info(f"Telegram: TCP route :{port} {state}")
