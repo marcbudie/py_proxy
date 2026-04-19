@@ -1600,6 +1600,7 @@ async function load() {
           <div class="route-stats">
             <span class="s-ok">${rt.ok} verbindingen</span>${rt.rejected ? ` &middot; <span class="s-rej">${rt.rejected} geweigerd</span>` : ''}
           </div>
+          <div style="font-size:.75rem;color:#e06000;min-height:.9rem" id="cd-tls-${esc(rt.hostname)}"></div>
         </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
         <td style="white-space:nowrap">
@@ -1608,7 +1609,6 @@ async function load() {
                  title="Minuten tot auto-uitschakelen (0 = nooit)"
                  onchange='setAutoDisable(${JSON.stringify(rt.hostname)}, this.value, "tls")'>
           <span style="font-size:.8rem;color:#888">min</span>
-          ${rt.enabled_until ? `<div style="font-size:.75rem;color:#e06000" id="cd-tls-${esc(rt.hostname)}"></div>` : ''}
         </td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
@@ -1696,6 +1696,7 @@ async function loadTcp() {
           <div class="route-stats">
             <span class="s-ok">${rt.ok} verbindingen</span>${rt.rejected ? ` &middot; <span class="s-rej">${rt.rejected} geweigerd</span>` : ''}
           </div>
+          <div style="font-size:.75rem;color:#e06000;min-height:.9rem" id="cd-tcp-${rt.listen_port}"></div>
         </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
         <td style="white-space:nowrap">
@@ -1704,7 +1705,6 @@ async function loadTcp() {
                  title="Minuten tot auto-uitschakelen (0 = nooit)"
                  onchange='setAutoDisable(${rt.listen_port}, this.value, "tcp")'>
           <span style="font-size:.8rem;color:#888">min</span>
-          ${rt.enabled_until ? `<div style="font-size:.75rem;color:#e06000" id="cd-tcp-${rt.listen_port}"></div>` : ''}
         </td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
@@ -2017,6 +2017,7 @@ MINI_APP_HTML = """\
       margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .route-stats { font-size: 11px; margin-top: 3px; }
+    .route-timer { font-size: 11px; color: #e06000; margin-top: 2px; }
     .ok  { color: #34c759; }
     .rej { color: #ff3b30; }
     .toggle { position: relative; width: 51px; height: 31px; flex-shrink: 0; }
@@ -2091,6 +2092,19 @@ function fmtUp(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h?
 let _tt;
 function toast(msg){const e=document.getElementById('toast');e.textContent=msg;e.classList.add('on');clearTimeout(_tt);_tt=setTimeout(()=>e.classList.remove('on'),2200);}
 
+const _cdTimers={};
+function _startCountdown(elId,until){
+  if(_cdTimers[elId])clearInterval(_cdTimers[elId]);
+  _cdTimers[elId]=setInterval(()=>{
+    const el=document.getElementById(elId);
+    if(!el){clearInterval(_cdTimers[elId]);delete _cdTimers[elId];return;}
+    const rem=Math.max(0,Math.round(until-Date.now()/1000));
+    const m=Math.floor(rem/60),s=rem%60;
+    el.textContent='\u23F1 Uit over '+m+':'+String(s).padStart(2,'0');
+    if(rem===0){clearInterval(_cdTimers[elId]);delete _cdTimers[elId];}
+  },1000);
+}
+
 function icon(name){
   const n=name.toLowerCase();
   if(n.includes('ssh'))return'&#x1F510;';
@@ -2103,17 +2117,17 @@ function icon(name){
 
 function card(r,type){
   const id=type==='tls'?r.hostname:r.listen_port;
-  const sub=type==='tls'?r.hostname+' &rarr; '+r.host+':'+r.port
-                         +':'+r.listen_port+' &rarr; '+r.host+':'+r.port:'';
   const label=type==='tls'?esc(r.hostname):':'+r.listen_port;
   const ok=r.ok||0, rej=r.rejected||0;
   const stats='<span class="ok">'+ok+' verbindingen</span>'+(rej?' &middot; <span class="rej">'+rej+' geweigerd</span>':'');
+  const cdId='cd-'+type+'-'+esc(String(id));
   return '<div class="route-row">'
     +'<div class="route-icon">'+icon(r.name)+'</div>'
     +'<div class="route-info">'
       +'<div class="route-name">'+esc(r.name)+'</div>'
       +'<div class="route-host">'+label+'</div>'
       +'<div class="route-stats">'+stats+'</div>'
+      +'<div class="route-timer" id="'+cdId+'"></div>'
     +'</div>'
     +'<label class="toggle">'
       +'<input type="checkbox"'+(r.enabled?' checked':'')
@@ -2134,6 +2148,12 @@ async function load(){
   if(d.tls_routes.length)html+='<div class="section"><div class="section-header">TLS routes</div><div class="card-list">'+d.tls_routes.map(r=>card(r,'tls')).join('')+'</div></div>';
   if(d.tcp_routes.length)html+='<div class="section"><div class="section-header">TCP routes</div><div class="card-list">'+d.tcp_routes.map(r=>card(r,'tcp')).join('')+'</div></div>';
   document.getElementById('main').innerHTML=html||'<div class="msg">Geen routes</div>';
+  d.tls_routes.forEach(rt=>{
+    if(rt.enabled_until)_startCountdown('cd-tls-'+esc(rt.hostname),rt.enabled_until);
+  });
+  d.tcp_routes.forEach(rt=>{
+    if(rt.enabled_until)_startCountdown('cd-tcp-'+esc(String(rt.listen_port)),rt.enabled_until);
+  });
 }
 
 async function tog(cb){
@@ -2146,6 +2166,14 @@ async function tog(cb){
     if(!r.ok)throw 0;
     const d=await r.json();
     cb.checked=d.enabled;
+    const cdId='cd-'+cb.dataset.type+'-'+cb.dataset.id;
+    const timerEl=document.getElementById(cdId);
+    if(d.enabled&&d.enabled_until){
+      _startCountdown(cdId,d.enabled_until);
+    }else{
+      if(_cdTimers[cdId]){clearInterval(_cdTimers[cdId]);delete _cdTimers[cdId];}
+      if(timerEl)timerEl.textContent='';
+    }
     if(tg.HapticFeedback)tg.HapticFeedback.impactOccurred('light');
     toast(d.enabled?'\\u2705 Ingeschakeld':'\\u274C Uitgeschakeld');
   }catch{cb.checked=!cb.checked;toast('Toggle mislukt');}
@@ -2238,6 +2266,15 @@ async def handle_tcp_connection(
             await writer.wait_closed()
         except Exception:
             pass
+
+
+def _apply_toggle(backend: Backend) -> None:
+    """Toggle backend.enabled en zet/wis enabled_until conform auto_disable_minutes."""
+    backend.enabled = not backend.enabled
+    if backend.enabled and backend.auto_disable_minutes > 0:
+        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
+    else:
+        backend.enabled_until = None
 
 
 async def handle_admin(
@@ -2560,6 +2597,8 @@ async def handle_admin(
                 "tls_routes": [
                     {"hostname": h, "host": b.host, "port": b.port, "name": b.name,
                      "enabled": b.enabled,
+                     "auto_disable_minutes": b.auto_disable_minutes,
+                     "enabled_until": b.enabled_until,
                      "ok":       _stats["tls_ok"].get(h, 0),
                      "rejected": _stats["tls_rej"].get(h, 0)}
                     for h, b in proxy_server.cfg.tls_routes.items()
@@ -2567,6 +2606,8 @@ async def handle_admin(
                 "tcp_routes": [
                     {"listen_port": p, "host": b.host, "port": b.port, "name": b.name,
                      "enabled": b.enabled,
+                     "auto_disable_minutes": b.auto_disable_minutes,
+                     "enabled_until": b.enabled_until,
                      "ok":       _stats["tcp_ok"].get(b.name, 0),
                      "rejected": _stats["tcp_rej"].get(b.name, 0)}
                     for p, b in proxy_server.cfg.tcp_routes.items()
@@ -2691,11 +2732,7 @@ async def handle_admin(
                 if backend is None:
                     json_resp(404, {"error": "Route niet gevonden."})
                 else:
-                    backend.enabled = not backend.enabled
-                    if backend.enabled and backend.auto_disable_minutes > 0:
-                        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
-                    else:
-                        backend.enabled_until = None
+                    _apply_toggle(backend)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"Route {hostname} {state} via admin UI")
@@ -2724,11 +2761,7 @@ async def handle_admin(
                 if backend is None:
                     json_resp(404, {"error": "TCP route niet gevonden."})
                 else:
-                    backend.enabled = not backend.enabled
-                    if backend.enabled and backend.auto_disable_minutes > 0:
-                        backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
-                    else:
-                        backend.enabled_until = None
+                    _apply_toggle(backend)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"TCP route :{listen_port} {state} via admin UI")
@@ -3034,7 +3067,9 @@ async def _tg_handle_message(
                 "chat_id": chat_id, "text": "⚠️ Route proxy.budie.eu niet gevonden in config.",
             })
         else:
-            backend.enabled = command == "/proxyaan"
+            new_enabled = command == "/proxyaan"
+            if backend.enabled != new_enabled:
+                _apply_toggle(backend)
             save_config(proxy.cfg, proxy.config_path)
             state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
             icon  = "✅" if backend.enabled else "❌"
@@ -3069,7 +3104,7 @@ async def _tg_handle_callback(
             await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
                                     {"callback_query_id": cb_id, "text": "Route niet gevonden"})
             return
-        backend.enabled = not backend.enabled
+        _apply_toggle(backend)
         save_config(proxy.cfg, proxy.config_path)
         state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
         logger.info(f"Telegram: TLS route {hostname} {state}")
@@ -3085,7 +3120,7 @@ async def _tg_handle_callback(
             await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
                                     {"callback_query_id": cb_id, "text": "TCP route niet gevonden"})
             return
-        backend.enabled = not backend.enabled
+        _apply_toggle(backend)
         save_config(proxy.cfg, proxy.config_path)
         state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
         logger.info(f"Telegram: TCP route :{port} {state}")
