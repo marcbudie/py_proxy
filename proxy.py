@@ -1600,6 +1600,7 @@ async function load() {
           <div class="route-stats">
             <span class="s-ok">${rt.ok} verbindingen</span>${rt.rejected ? ` &middot; <span class="s-rej">${rt.rejected} geweigerd</span>` : ''}
           </div>
+          <div style="font-size:.75rem;color:#e06000;min-height:.9rem" id="cd-tls-${esc(rt.hostname)}"></div>
         </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
         <td style="white-space:nowrap">
@@ -1608,7 +1609,6 @@ async function load() {
                  title="Minuten tot auto-uitschakelen (0 = nooit)"
                  onchange='setAutoDisable(${JSON.stringify(rt.hostname)}, this.value, "tls")'>
           <span style="font-size:.8rem;color:#888">min</span>
-          ${rt.enabled_until ? `<div style="font-size:.75rem;color:#e06000" id="cd-tls-${esc(rt.hostname)}"></div>` : ''}
         </td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
@@ -1696,6 +1696,7 @@ async function loadTcp() {
           <div class="route-stats">
             <span class="s-ok">${rt.ok} verbindingen</span>${rt.rejected ? ` &middot; <span class="s-rej">${rt.rejected} geweigerd</span>` : ''}
           </div>
+          <div style="font-size:.75rem;color:#e06000;min-height:.9rem" id="cd-tcp-${rt.listen_port}"></div>
         </td>
         <td><span class="badge ${rt.enabled ? 'badge-on' : 'badge-off'}">${rt.enabled ? 'Aan' : 'Uit'}</span></td>
         <td style="white-space:nowrap">
@@ -1704,7 +1705,6 @@ async function loadTcp() {
                  title="Minuten tot auto-uitschakelen (0 = nooit)"
                  onchange='setAutoDisable(${rt.listen_port}, this.value, "tcp")'>
           <span style="font-size:.8rem;color:#888">min</span>
-          ${rt.enabled_until ? `<div style="font-size:.75rem;color:#e06000" id="cd-tcp-${rt.listen_port}"></div>` : ''}
         </td>
         <td>
           <label class="toggle" title="${rt.enabled ? 'Klik om uit te zetten' : 'Klik om aan te zetten'}">
