@@ -302,16 +302,77 @@ Onder `/status` staat een inline-keyboard met één knop per route. Klikken togg
 Per TLS-route: aantal succesvolle verbindingen en geweigerd (route uitgeschakeld).  
 Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 
-## Veiligheid
+## Beveiliging
+
+### Systeem- en procesisolatie
 
 - **Dedicated systeemgebruiker** — de service draait als `pyproxy` (geen login shell, geen home dir) vanuit `/opt/py_proxy`. Dit beperkt de blast radius bij een eventuele kwetsbaarheid.
-- **config.json** — bevat Gmail app-wachtwoord, Telegram bot-token en TOTP-geheim. Nooit in git committen. Alleen leesbaar als root (acceptabel).
-- **TOTP-geheim** — sla een back-up op bij het instellen. Zonder back-up en zonder werkende e-mail/Telegram-fallback ben je buitengesloten als je de authenticator-app kwijtraakt.
-- **Telegram bot** — bot-commando's werken via outbound long-polling; de `proxy.budie.eu` TLS route hoeft **niet** actief te zijn. De Mini App (`/app`) vereist de route **wel** — die wordt geserveerd via de admin UI op poort 9443.
+- **SELinux-vriendelijk deploy** — bestanden in `/opt` krijgen `usr_t` context na `restorecon`; systemd kan deze uitvoeren. Bestanden in `$HOME` met `user_home_t` worden geblokkeerd.
+- **Sudoers strikt begrensd** — `pyproxy` mag uitsluitend `sudo systemctl restart py-proxy` uitvoeren; geen andere escalatiemogelijkheden.
+- **config.json niet in git** — bevat Gmail app-wachtwoord, Telegram bot-token en TOTP-geheim. Nooit committen. Op het systeem alleen leesbaar als root.
+- **TOTP-geheim backup** — sla het geheim op bij het instellen. Zonder backup én zonder werkende e-mail/Telegram-fallback ben je buitengesloten als je de authenticator-app kwijtraakt.
+
+### Netwerk en toegangscontrole
+
+- **Admin UI niet direct bereikbaar** — poort 9443 staat niet open in de firewall; de UI is alleen bereikbaar via de TLS route `proxy.budie.eu` (SNI → localhost:9443).
+- **Admin UI vereist HTTPS** — de proxy weigert te starten zonder geldig `tls_cert`/`tls_key`; plaintext HTTP is niet mogelijk.
+- **SNI-validatie** — verbindingen zonder geldig SNI-veld in de ClientHello worden direct verbroken; de proxy routeert nooit blindweg.
+- **Uitgeschakelde routes** — TCP routes laten de verbinding direct vallen; TLS routes sturen een 503-pagina terug als er een cert beschikbaar is, anders stille sluiting.
 - **FreeCourts firewall-regel** (8444→8443) — omzeilt de proxy volledig. Nu disabled; niet inschakelen tenzij bewust gewenst.
-- **TLS private keys** — proxy logt een waarschuwing bij opstarten als een key-bestand bredere permissies heeft dan `0o600`.
-- **Terminal WebSocket** (`/term_sock`) — maximaal 1 gelijktijdige sessie per sessie-token; tweede poging krijgt HTTP 409.
-- **Telegram /logs** — filtert regels met `password`, `secret`, `token` of `key` vóór verzending naar Telegram.
+
+### TLS en certificaten
+
+- **TLS private key permissiecheck** — bij elke start logt de proxy een waarschuwing als een key-bestand ruimere permissies heeft dan `0o600`.
+- **TLS handshake timeout** — 10 seconden; hangende handshakes worden afgebroken.
+- **Idle connection timeout** (TLS-terminatie modus) — verbindingen zonder activiteit worden na 30 seconden gesloten; voorkomt event-loop-vervuiling door idle keep-alive sessies.
+- **SMTP via SSL/TLS** — OTP-e-mails worden verstuurd via `SMTP_SSL` (versleuteld kanaal); het Gmail app-wachtwoord gaat nooit plaintext over het netwerk.
+
+### Authenticatie en sessies
+
+Zie ook de volledige beschrijving onder [Authenticatie](#authenticatie).
+
+- **TOTP geheimgeneratie** — `secrets.token_bytes(20)` (160 bits); cryptografisch veilig, niet voorspelbaar.
+- **Constante-tijd vergelijking** — TOTP-codes worden vergeleken met `hmac.compare_digest()` om timing-aanvallen te voorkomen.
+- **TOTP replay-bescherming** — gebruikte time-steps worden bijgehouden in `_totp_used_steps`; hergebruik van een code binnen hetzelfde venster wordt geblokkeerd.
+- **OTP willekeurigheid** — 8-cijferige codes gegenereerd met `secrets.randbelow()`; niet met `random`.
+- **OTP rate limiting** — minimaal 60 seconden tussen aanvragen, gehandhaafd per IP-adres; bij overschrijding HTTP 429.
+- **OTP brute force-bescherming** — na 10 foutieve verificatiepogingen wordt de openstaande code ongeldig gemaakt.
+- **Sessiecookie flags** — `proxy_session` heeft `HttpOnly; Secure; SameSite=Strict`; JavaScript kan de cookie niet uitlezen en cross-site requests sturen de cookie niet mee (CSRF-bescherming zonder apart token).
+- **Sliding window expiry** — elke geauthenticeerde request verlengt de sessie-TTL met 30 minuten; na 30 minuten inactiviteit vervalt de sessie automatisch.
+- **Sessie cleanup** — verlopen sessies en OTP-codes worden elke 60 seconden opgeruimd.
+
+### Telegram-beveiliging
+
+- **Outbound long-polling** — de bot werkt puur via uitgaande HTTPS-verbindingen naar de Telegram API; er is geen inkomende poort of webhook nodig.
+- **WebApp initData-validatie** — de Mini App stuurt een HMAC-SHA256 gesigneerde `initData`; de proxy verifieert de handtekening met een sleutel afgeleid van het bot-token.
+- **auth_date tijdvenster** — `initData` ouder dan 24 uur wordt geweigerd; dit beperkt de herbruikbaarheid van onderschepte tokens.
+- **allowed_chat_ids gehandhaafd op alle handlers** — zowel bot-commando's, callback queries als WebApp-requests worden geweigerd als de chat-ID niet in de allowlist staat. Een lege lijst sluit iedereen buiten.
+- **Gevoelige data gefilterd in /logs** — regels met `password`, `secret`, `token` of `key` worden verwijderd vóór verzending naar Telegram.
+
+### WebSocket-beveiliging (`/term_sock`)
+
+- **Authenticatie vereist** — WebSocket-upgrade zonder geldige sessiecookie krijgt HTTP 401.
+- **Maximaal 1 actieve sessie per token** — een tweede poging met hetzelfde sessie-token krijgt HTTP 409; voorkomt sessie-hijacking via meerdere gelijktijdige terminals.
+- **Frame size limit** — inkomende WebSocket-frames groter dan 1 MB worden geweigerd.
+- **RFC 6455-correcte handshake** — `Sec-WebSocket-Accept` wordt berekend met SHA-1 + magic string conform de standaard.
+
+### Input-validatie en XSS-preventie
+
+- **html.escape() op foutpagina's** — de SNI-hostnaam en het admin-adres worden ge-escaped vóór opname in HTML-responses; voorkomt reflected XSS.
+- **JSON-parsing met validatie** — alle API-endpoints parsen de body in een try/except en retourneren HTTP 400 bij malformed JSON of ontbrekende velden.
+- **TOTP secret-validatie** — het geheim wordt base32-gedecodeerd vóór opslag; ongeldige geheimen worden geweigerd.
+
+### Request- en verbindingstimeouts (admin UI)
+
+| Fase | Timeout |
+|------|---------|
+| Request-regel lezen | 30 seconden |
+| Headers lezen | 10 seconden per regel |
+| Body lezen | 10 seconden |
+| Backend connect | configureerbaar, standaard 10 s |
+| Backend read | configureerbaar, standaard 5 s |
+| TLS handshake | 10 seconden |
+| Idle (TLS-terminatie) | 30 seconden |
 
 ## Bekende valkuilen
 
