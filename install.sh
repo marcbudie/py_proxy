@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # install.sh — deploy naar /opt/py_proxy, systeemgebruiker aanmaken, service starten
 # Gebruik: sudo bash install.sh
+#
+# Voor containerdeployment: zie Dockerfile en docker-compose.yml
+#   docker compose up -d --build
 
 set -euo pipefail
 
@@ -118,11 +121,17 @@ echo "Klaar. De proxy draait als '${SERVICE_USER}' vanuit ${DEPLOY_DIR}."
 echo ""
 echo "Na een update van proxy.py: sudo bash install.sh"
 echo ""
-echo "Handige commando's:"
+echo "Handige commando's (systemd):"
 echo "  systemctl status  ${SERVICE_NAME}   # status bekijken"
 echo "  journalctl -u ${SERVICE_NAME} -f     # logs volgen"
 echo "  systemctl reload  ${SERVICE_NAME}   # config herladen (SIGHUP)"
 echo "  systemctl restart ${SERVICE_NAME}   # herstarten na nieuwe versie"
 echo "  systemctl stop    ${SERVICE_NAME}   # stoppen"
+echo ""
+echo "Container (alternatief voor systemd):"
+echo "  docker compose up -d --build        # bouwen en starten"
+echo "  docker compose logs -f              # logs volgen"
+echo "  docker compose restart              # herstarten"
+echo "  docker compose down                 # stoppen"
 echo ""
 echo "Admin UI: https://<host>:9443/"
