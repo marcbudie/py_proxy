@@ -1,0 +1,32 @@
+[Unit]
+Description=SNI Proxy (Podman container)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+# Verwijder eventuele restcontainer van vorige run
+ExecStartPre=-/usr/bin/podman rm -f py-proxy
+
+ExecStart=/usr/bin/podman run --rm \
+    --name py-proxy \
+    --network host \
+    -v /opt/py_proxy/config.json:/opt/py_proxy/config.json:ro \
+    -v /home/admin/ssl:/home/admin/ssl:ro \
+    py-proxy:latest
+
+ExecStop=/usr/bin/podman stop py-proxy
+
+# Config herladen zonder herstart (stuurt SIGHUP naar PID 1 in de container)
+ExecReload=/usr/bin/podman kill -s HUP py-proxy
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=py-proxy
+
+[Install]
+WantedBy=multi-user.target

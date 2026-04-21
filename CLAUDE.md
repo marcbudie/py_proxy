@@ -8,7 +8,8 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 - `config.json` — runtime configuratie (wordt live bijgehouden door de admin UI, **niet in git** vanwege Gmail app-wachtwoord)
 - `requirements.txt` — één externe dependency: `segno` (QR-code generatie voor TOTP setup pagina)
 - `Dockerfile` — container image op basis van `python:3.11-slim`
-- `compose.yml` — start de proxy als container op het host network (werkt met `podman compose` en `docker compose`)
+- `compose.yml` — handmatig starten van de container (ontwikkeling/testen); productie loopt via systemd
+- `proxy-container.service` — systemd service unit voor de Podman container (draait als root)
 - `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen, vanuit de checkout)
 - `proxy.service` — systemd service unit (draait als `pyproxy` vanuit `/opt/py_proxy`)
 - `install.sh` — interactief installatiescript voor systemd of Podman container
@@ -24,28 +25,28 @@ sudo bash install.sh --systemd   # altijd systemd
 sudo bash install.sh --container # altijd Podman container
 ```
 
-### Via Podman (container)
+### Via Podman (container, beheerd door systemd)
 
 `install.sh --container` doet:
-1. Controleren of `podman` en `podman compose` beschikbaar zijn
+1. `proxy.py`, `Dockerfile` en `requirements.txt` kopiëren naar `/opt/py_proxy/`
 2. `/opt/py_proxy/config.json` klaarzetten (alleen als die nog niet bestaat)
-3. Container image bouwen vanuit de huidige checkout (`proxy.py` + `requirements.txt`)
-4. Eventueel lopende container stoppen en de nieuwe starten
+3. Container image bouwen als root: `podman build -t py-proxy:latest /opt/py_proxy/`
+4. `proxy-container.service` installeren als `py-proxy.service`
+5. Service inschakelen en (her)starten
 
-De container draait met `network_mode: host` — geen poortmapping nodig. Logs en beheer:
+Systemd start de container via `podman run` als root. De container deelt het host-netwerk (`--network host`) — geen poortmapping nodig. Beheer loopt volledig via de bekende systemd-commando's:
 
 ```bash
-podman compose logs -f               # logs volgen
-podman compose kill -s HUP py-proxy  # config herladen (SIGHUP)
-podman compose restart py-proxy      # herstarten
-podman compose down                  # stoppen
+systemctl status  py-proxy        # status bekijken
+journalctl -u py-proxy -f         # logs volgen
+systemctl reload  py-proxy        # config herladen (SIGHUP naar container)
+systemctl restart py-proxy        # herstarten
+systemctl stop    py-proxy        # stoppen
 ```
 
-`compose.yml` montet `/opt/py_proxy/config.json` en `/home/admin/ssl` als read-only volumes. Pas de cert-paden aan als je certs ergens anders staan.
+`proxy-container.service` montet `/opt/py_proxy/config.json` en `/home/admin/ssl` read-only in de container. Pas de volume-paden in het service-bestand aan als je certs ergens anders staan.
 
-**Vereiste:** `podman-compose` geïnstalleerd (`pip3 install podman-compose`).
-
-**Let op:** het Telegram `/restart`-commando roept `sudo systemctl restart py-proxy` aan — dat werkt niet in een container. Gebruik `podman compose restart py-proxy` als handmatige fallback.
+Het Telegram `/restart`-commando (`sudo systemctl restart py-proxy`) werkt in beide modi identiek.
 
 ### Via systemd
 

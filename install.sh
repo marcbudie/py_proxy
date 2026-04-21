@@ -166,44 +166,51 @@ if [[ "$MODE" == "systemd" ]]; then
     echo "  systemctl restart ${SERVICE_NAME}     # herstarten"
     echo "  systemctl stop    ${SERVICE_NAME}     # stoppen"
 
-# ── Container (Podman) ────────────────────────────────────────────────────────
+# ── Container (Podman, beheerd door systemd als root) ─────────────────────────
 
 elif [[ "$MODE" == "container" ]]; then
-
-    # Rootless Podman draait onder de gewone gebruiker — gebruik SUDO_USER
-    PODMAN_USER="${SUDO_USER:-root}"
 
     if ! command -v podman &>/dev/null; then
         echo "FOUT: 'podman' niet gevonden. Installeer Podman eerst."
         exit 1
     fi
-    if ! sudo -u "$PODMAN_USER" podman compose version &>/dev/null 2>&1; then
-        echo "FOUT: 'podman compose' niet beschikbaar voor '$PODMAN_USER'."
-        echo "Installeer podman-compose:  pip3 install podman-compose"
-        exit 1
-    fi
 
-    echo "=== [1/3] Config-directory voorbereiden ==="
+    echo "=== [1/4] Bestanden deployen naar $DEPLOY_DIR ==="
+    mkdir -p "$DEPLOY_DIR"
+    cp "$SCRIPT_DIR/proxy.py"         "$DEPLOY_DIR/proxy.py"
+    cp "$SCRIPT_DIR/Dockerfile"       "$DEPLOY_DIR/Dockerfile"
+    cp "$SCRIPT_DIR/requirements.txt" "$DEPLOY_DIR/requirements.txt"
+    echo "proxy.py, Dockerfile, requirements.txt gekopieerd."
     _ensure_config
 
     echo ""
-    echo "=== [2/3] Container image bouwen en (her)starten ==="
-    # --build zorgt dat proxy.py altijd opnieuw in het image wordt gebakken.
-    cd "$SCRIPT_DIR"
-    sudo -u "$PODMAN_USER" podman compose up -d --build
+    echo "=== [2/4] Container image bouwen ==="
+    podman build -t py-proxy:latest "$DEPLOY_DIR"
 
     echo ""
-    echo "=== [3/3] Status ==="
-    sudo -u "$PODMAN_USER" podman compose ps
+    echo "=== [3/4] Systemd service installeren ==="
+    cp "$SCRIPT_DIR/proxy-container.service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+    chmod 644 "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+    systemctl daemon-reload
 
     echo ""
-    echo "Klaar. De proxy draait als Podman container (gebruiker: ${PODMAN_USER})."
+    echo "=== [4/4] Service activeren en (her)starten ==="
+    systemctl enable "${SERVICE_NAME}.service"
+    systemctl restart "${SERVICE_NAME}.service"
+
+    echo ""
+    echo "=== Status ==="
+    systemctl status "${SERVICE_NAME}.service" --no-pager -l || true
+
+    echo ""
+    echo "Klaar. De proxy draait als Podman container, gestart door systemd als root."
     echo ""
     echo "Handige commando's:"
-    echo "  podman compose logs -f               # logs volgen"
-    echo "  podman compose kill -s HUP py-proxy  # config herladen (SIGHUP)"
-    echo "  podman compose restart py-proxy      # herstarten"
-    echo "  podman compose down                  # stoppen"
+    echo "  systemctl status  ${SERVICE_NAME}     # status bekijken"
+    echo "  journalctl -u ${SERVICE_NAME} -f       # logs volgen"
+    echo "  systemctl reload  ${SERVICE_NAME}     # config herladen (SIGHUP)"
+    echo "  systemctl restart ${SERVICE_NAME}     # herstarten"
+    echo "  systemctl stop    ${SERVICE_NAME}     # stoppen"
 
 fi
 
