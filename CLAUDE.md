@@ -8,7 +8,7 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 - `config.json` — runtime configuratie (wordt live bijgehouden door de admin UI, **niet in git** vanwege Gmail app-wachtwoord)
 - `requirements.txt` — één externe dependency: `segno` (QR-code generatie voor TOTP setup pagina)
 - `Dockerfile` — container image op basis van `python:3.11-slim`
-- `docker-compose.yml` — start de proxy als container op het host network
+- `compose.yml` — start de proxy als container op het host network (werkt met `podman compose` en `docker compose`)
 - `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen, vanuit de checkout)
 - `proxy.service` — systemd service unit (draait als `pyproxy` vanuit `/opt/py_proxy`)
 - `install.sh` — maakt systeemgebruiker aan, deployt naar `/opt/py_proxy`, installeert en start service
@@ -16,30 +16,32 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 
 ## Installeren en starten
 
-### Via Docker (aanbevolen voor containers)
+### Via Podman (aanbevolen voor containers)
+
+Vereist `podman` en `podman-compose` (of `podman compose` als plugin):
 
 ```bash
 # Eenmalig bouwen en starten
-docker compose up -d --build
+podman compose up -d --build
 
 # Logs volgen
-docker compose logs -f
+podman compose logs -f
 
 # Config herladen (stuurt SIGHUP naar het proces in de container)
-docker compose kill -s HUP py-proxy
+podman compose kill -s HUP py-proxy
 
 # Herstarten na nieuwe versie
-docker compose up -d --build
+podman compose up -d --build
 
 # Stoppen
-docker compose down
+podman compose down
 ```
 
-`docker-compose.yml` mount `/opt/py_proxy/config.json` en `/home/admin/ssl` als read-only volumes. Pas de cert-paden aan als je certs ergens anders staan.
+`compose.yml` mount `/opt/py_proxy/config.json` en `/home/admin/ssl` als read-only volumes. Pas de cert-paden aan als je certs ergens anders staan.
 
 De container draait met `network_mode: host` zodat de proxy dezelfde poorten gebruikt als bij een bare-metal installatie. Er zijn geen `EXPOSE`-regels nodig.
 
-**Let op:** het Telegram `/restart`-commando roept `sudo systemctl restart py-proxy` aan, wat niet werkt in een container. Gebruik daarvoor `docker compose restart py-proxy` of herstart de container via een externe trigger.
+**Let op:** het Telegram `/restart`-commando roept `sudo systemctl restart py-proxy` aan, wat niet werkt in een container. Gebruik daarvoor `podman compose restart py-proxy` als handmatige fallback.
 
 ### Via systemd
 
@@ -404,5 +406,5 @@ Zie ook de volledige beschrijving onder [Authenticatie](#authenticatie).
 - `onchange`-attribuut in de admin UI gebruikt enkele aanhalingstekens — `JSON.stringify` geeft dubbele aanhalingstekens terug die het HTML-attribuut anders zouden breken.
 - Pad-gebaseerde routing (hostname + pad) is geprobeerd maar werkt niet betrouwbaar voor applicaties zoals pfSense die URLs dynamisch opbouwen in JavaScript. Gebruik altijd een eigen subdomein per applicatie.
 - HTTP/2 connection coalescing: als twee domeinen hetzelfde wildcard-cert en IP-adres delen, hergebruikt de browser de TLS-verbinding. Geef zulke domeinen een eigen cert om dit te voorkomen.
-- Bij containerdeployment werkt het Telegram `/restart`-commando niet (roept `systemctl` aan). Gebruik `docker compose restart py-proxy` als handmatige fallback.
+- Bij containerdeployment werkt het Telegram `/restart`-commando niet (roept `systemctl` aan). Gebruik `podman compose restart py-proxy` als handmatige fallback.
 - Bij containerdeployment werkt `/logs` (leest journald) mogelijk niet als journald niet beschikbaar is in de container. Gebruik `docker compose logs` in dat geval.

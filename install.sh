@@ -2,8 +2,8 @@
 # install.sh — deploy naar /opt/py_proxy, systeemgebruiker aanmaken, service starten
 # Gebruik: sudo bash install.sh
 #
-# Voor containerdeployment: zie Dockerfile en docker-compose.yml
-#   docker compose up -d --build
+# Voor containerdeployment: zie Dockerfile en compose.yml
+#   podman compose up -d --build
 
 set -euo pipefail
 
@@ -128,10 +128,10 @@ echo "  systemctl reload  ${SERVICE_NAME}   # config herladen (SIGHUP)"
 echo "  systemctl restart ${SERVICE_NAME}   # herstarten na nieuwe versie"
 echo "  systemctl stop    ${SERVICE_NAME}   # stoppen"
 echo ""
-echo "Container (alternatief voor systemd):"
-echo "  docker compose up -d --build        # bouwen en starten"
-echo "  docker compose logs -f              # logs volgen"
-echo "  docker compose restart              # herstarten"
-echo "  docker compose down                 # stoppen"
+echo "Container (alternatief voor systemd — met Podman):"
+echo "  podman compose up -d --build        # bouwen en starten"
+echo "  podman compose logs -f              # logs volgen"
+echo "  podman compose restart              # herstarten"
+echo "  podman compose down                 # stoppen"
 echo ""
 echo "Admin UI: https://<host>:9443/"

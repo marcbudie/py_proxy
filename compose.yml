@@ -8,7 +8,3 @@ services:
       - /opt/py_proxy/config.json:/opt/py_proxy/config.json:ro
       # Pas onderstaande paden aan aan de locatie van je TLS-certs:
       - /home/admin/ssl:/home/admin/ssl:ro
-    logging:
-      driver: journald
-      options:
-        tag: py-proxy
