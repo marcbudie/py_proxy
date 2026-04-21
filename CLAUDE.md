@@ -11,52 +11,52 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 - `compose.yml` — start de proxy als container op het host network (werkt met `podman compose` en `docker compose`)
 - `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen, vanuit de checkout)
 - `proxy.service` — systemd service unit (draait als `pyproxy` vanuit `/opt/py_proxy`)
-- `install.sh` — maakt systeemgebruiker aan, deployt naar `/opt/py_proxy`, installeert en start service
+- `install.sh` — interactief installatiescript voor systemd of Podman container
 - `backup.sh` — sync naar Google Drive via rclone (`google:backup/py_proxy`)
 
-## Installeren en starten
+## Installeren en updaten
 
-### Via Podman (aanbevolen voor containers)
-
-Vereist `podman` en `podman-compose` (of `podman compose` als plugin):
+Beide deploymethoden gebruiken hetzelfde script. Elke keer opnieuw uitvoeren installeert de nieuwste `proxy.py` en herstart de service — `config.json` wordt nooit overschreven.
 
 ```bash
-# Eenmalig bouwen en starten
-podman compose up -d --build
-
-# Logs volgen
-podman compose logs -f
-
-# Config herladen (stuurt SIGHUP naar het proces in de container)
-podman compose kill -s HUP py-proxy
-
-# Herstarten na nieuwe versie
-podman compose up -d --build
-
-# Stoppen
-podman compose down
+sudo bash install.sh              # interactief: kies systemd of container
+sudo bash install.sh --systemd   # altijd systemd
+sudo bash install.sh --container # altijd Podman container
 ```
 
-`compose.yml` mount `/opt/py_proxy/config.json` en `/home/admin/ssl` als read-only volumes. Pas de cert-paden aan als je certs ergens anders staan.
+### Via Podman (container)
 
-De container draait met `network_mode: host` zodat de proxy dezelfde poorten gebruikt als bij een bare-metal installatie. Er zijn geen `EXPOSE`-regels nodig.
+`install.sh --container` doet:
+1. Controleren of `podman` en `podman compose` beschikbaar zijn
+2. `/opt/py_proxy/config.json` klaarzetten (alleen als die nog niet bestaat)
+3. Container image bouwen vanuit de huidige checkout (`proxy.py` + `requirements.txt`)
+4. Eventueel lopende container stoppen en de nieuwe starten
 
-**Let op:** het Telegram `/restart`-commando roept `sudo systemctl restart py-proxy` aan, wat niet werkt in een container. Gebruik daarvoor `podman compose restart py-proxy` als handmatige fallback.
+De container draait met `network_mode: host` — geen poortmapping nodig. Logs en beheer:
+
+```bash
+podman compose logs -f               # logs volgen
+podman compose kill -s HUP py-proxy  # config herladen (SIGHUP)
+podman compose restart py-proxy      # herstarten
+podman compose down                  # stoppen
+```
+
+`compose.yml` montet `/opt/py_proxy/config.json` en `/home/admin/ssl` als read-only volumes. Pas de cert-paden aan als je certs ergens anders staan.
+
+**Vereiste:** `podman-compose` geïnstalleerd (`pip3 install podman-compose`).
+
+**Let op:** het Telegram `/restart`-commando roept `sudo systemctl restart py-proxy` aan — dat werkt niet in een container. Gebruik `podman compose restart py-proxy` als handmatige fallback.
 
 ### Via systemd
 
-```bash
-sudo bash install.sh
-```
-
-Dit doet:
+`install.sh --systemd` doet:
 1. Systeemgebruiker `pyproxy` aanmaken (als die nog niet bestaat)
-2. Python-dependencies installeren via `pip3 install --break-system-packages -r requirements.txt` (momenteel: `segno`)
+2. Python-dependencies installeren via `pip3 install --break-system-packages -r requirements.txt`
 3. `proxy.py` kopiëren naar `/opt/py_proxy/`
 4. `config.json` kopiëren naar `/opt/py_proxy/` (alleen als die er nog niet staat)
 5. Eigenaar instellen op `pyproxy`, SELinux context herstellen via `restorecon`
 6. Controleren of cert-bestanden leesbaar zijn voor `pyproxy`
-7. Systemd service installeren en starten
+7. Systemd service installeren en (her)starten
 
 De service heet `py-proxy` en draait als `pyproxy` vanuit `/opt/py_proxy`. Handige commando's:
 
@@ -64,10 +64,8 @@ De service heet `py-proxy` en draait als `pyproxy` vanuit `/opt/py_proxy`. Handi
 systemctl status  py-proxy        # status bekijken
 journalctl -u py-proxy -f         # logs volgen
 systemctl reload  py-proxy        # config herladen (SIGHUP)
-systemctl restart py-proxy        # herstarten na nieuwe versie
+systemctl restart py-proxy        # herstarten
 ```
-
-Na een update van `proxy.py`: `sudo bash install.sh` opnieuw uitvoeren (kopieert de nieuwe versie en herstart).
 
 #### Cert-bestanden toegankelijk maken voor pyproxy
 
@@ -76,8 +74,6 @@ De certs staan in `/home/admin/ssl/` en zijn world-readable, maar `/home/admin` 
 ```bash
 setfacl -m u:pyproxy:x /home/admin
 ```
-
-De subdirectories (`ssl/`, `ssl/ClouDNS/`, `ssl/freecourts/`) zijn `drwxr-xr-x` en de certbestanden zijn `-rw-r--r--` — na de traverse-ACL op `/home/admin` zijn ze direct leesbaar.
 
 `install.sh` controleert daarna of alle cert-bestanden leesbaar zijn en waarschuwt bij problemen.
 
