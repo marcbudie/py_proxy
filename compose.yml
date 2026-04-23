@@ -1,0 +1,15 @@
+# compose.yml — voor handmatig gebruik (testen, tijdelijk draaien).
+# Productie wordt beheerd via systemd (proxy-container.service), niet via compose.
+#
+# Bouwen en starten:  podman compose up -d --build
+# Stoppen:            podman compose down
+
+services:
+  py-proxy:
+    build: .
+    image: py-proxy:latest
+    network_mode: host
+    volumes:
+      - /opt/py_proxy/config.json:/opt/py_proxy/config.json:ro
+      # Pas onderstaande paden aan aan de locatie van je TLS-certs:
+      - /home/admin/ssl:/home/admin/ssl:ro

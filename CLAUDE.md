@@ -7,27 +7,57 @@ Pure TCP SNI proxy — routeert HTTPS-verkeer op basis van de SNI-hostnaam zonde
 - `proxy.py` — de volledige proxy, één bestand
 - `config.json` — runtime configuratie (wordt live bijgehouden door de admin UI, **niet in git** vanwege Gmail app-wachtwoord)
 - `requirements.txt` — één externe dependency: `segno` (QR-code generatie voor TOTP setup pagina)
+- `Dockerfile` — container image op basis van `python:3.11-slim`
+- `compose.yml` — handmatig starten van de container (ontwikkeling/testen); productie loopt via systemd
+- `proxy-container.service` — systemd service unit voor de Podman container (draait als root)
 - `run.sh` — start de proxy direct met `/usr/bin/python3` (voor handmatig testen, vanuit de checkout)
 - `proxy.service` — systemd service unit (draait als `pyproxy` vanuit `/opt/py_proxy`)
-- `install.sh` — maakt systeemgebruiker aan, deployt naar `/opt/py_proxy`, installeert en start service
+- `install.sh` — interactief installatiescript voor systemd of Podman container
 - `backup.sh` — sync naar Google Drive via rclone (`google:backup/py_proxy`)
 
-## Installeren en starten
+## Installeren en updaten
 
-### Via systemd (aanbevolen)
+Beide deploymethoden gebruiken hetzelfde script. Elke keer opnieuw uitvoeren installeert de nieuwste `proxy.py` en herstart de service — `config.json` wordt nooit overschreven.
 
 ```bash
-sudo bash install.sh
+sudo bash install.sh              # interactief: kies systemd of container
+sudo bash install.sh --systemd   # altijd systemd
+sudo bash install.sh --container # altijd Podman container
 ```
 
-Dit doet:
+### Via Podman (container, beheerd door systemd)
+
+`install.sh --container` doet:
+1. `proxy.py`, `Dockerfile` en `requirements.txt` kopiëren naar `/opt/py_proxy/`
+2. `/opt/py_proxy/config.json` klaarzetten (alleen als die nog niet bestaat)
+3. Container image bouwen als root: `podman build -t py-proxy:latest /opt/py_proxy/`
+4. `proxy-container.service` installeren als `py-proxy.service`
+5. Service inschakelen en (her)starten
+
+Systemd start de container via `podman run` als root. De container deelt het host-netwerk (`--network host`) — geen poortmapping nodig. Beheer loopt volledig via de bekende systemd-commando's:
+
+```bash
+systemctl status  py-proxy        # status bekijken
+journalctl -u py-proxy -f         # logs volgen
+systemctl reload  py-proxy        # config herladen (SIGHUP naar container)
+systemctl restart py-proxy        # herstarten
+systemctl stop    py-proxy        # stoppen
+```
+
+`proxy-container.service` montet `/opt/py_proxy/config.json` en `/home/admin/ssl` read-only in de container. Pas de volume-paden in het service-bestand aan als je certs ergens anders staan.
+
+Het Telegram `/restart`-commando (`sudo systemctl restart py-proxy`) werkt in beide modi identiek.
+
+### Via systemd
+
+`install.sh --systemd` doet:
 1. Systeemgebruiker `pyproxy` aanmaken (als die nog niet bestaat)
-2. Python-dependencies installeren via `pip3 install --break-system-packages -r requirements.txt` (momenteel: `segno`)
+2. Python-dependencies installeren via `pip3 install --break-system-packages -r requirements.txt`
 3. `proxy.py` kopiëren naar `/opt/py_proxy/`
 4. `config.json` kopiëren naar `/opt/py_proxy/` (alleen als die er nog niet staat)
 5. Eigenaar instellen op `pyproxy`, SELinux context herstellen via `restorecon`
 6. Controleren of cert-bestanden leesbaar zijn voor `pyproxy`
-7. Systemd service installeren en starten
+7. Systemd service installeren en (her)starten
 
 De service heet `py-proxy` en draait als `pyproxy` vanuit `/opt/py_proxy`. Handige commando's:
 
@@ -35,10 +65,8 @@ De service heet `py-proxy` en draait als `pyproxy` vanuit `/opt/py_proxy`. Handi
 systemctl status  py-proxy        # status bekijken
 journalctl -u py-proxy -f         # logs volgen
 systemctl reload  py-proxy        # config herladen (SIGHUP)
-systemctl restart py-proxy        # herstarten na nieuwe versie
+systemctl restart py-proxy        # herstarten
 ```
-
-Na een update van `proxy.py`: `sudo bash install.sh` opnieuw uitvoeren (kopieert de nieuwe versie en herstart).
 
 #### Cert-bestanden toegankelijk maken voor pyproxy
 
@@ -47,8 +75,6 @@ De certs staan in `/home/admin/ssl/` en zijn world-readable, maar `/home/admin` 
 ```bash
 setfacl -m u:pyproxy:x /home/admin
 ```
-
-De subdirectories (`ssl/`, `ssl/ClouDNS/`, `ssl/freecourts/`) zijn `drwxr-xr-x` en de certbestanden zijn `-rw-r--r--` — na de traverse-ACL op `/home/admin` zijn ze direct leesbaar.
 
 `install.sh` controleert daarna of alle cert-bestanden leesbaar zijn en waarschuwt bij problemen.
 
@@ -302,16 +328,70 @@ Onder `/status` staat een inline-keyboard met één knop per route. Klikken togg
 Per TLS-route: aantal succesvolle verbindingen en geweigerd (route uitgeschakeld).  
 Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 
-## Veiligheid
+## Beveiliging
+
+### Systeem- en procesisolatie
 
 - **Dedicated systeemgebruiker** — de service draait als `pyproxy` (geen login shell, geen home dir) vanuit `/opt/py_proxy`. Dit beperkt de blast radius bij een eventuele kwetsbaarheid.
-- **config.json** — bevat Gmail app-wachtwoord, Telegram bot-token en TOTP-geheim. Nooit in git committen. Alleen leesbaar als root (acceptabel).
-- **TOTP-geheim** — sla een back-up op bij het instellen. Zonder back-up en zonder werkende e-mail/Telegram-fallback ben je buitengesloten als je de authenticator-app kwijtraakt.
-- **Telegram bot** — bot-commando's werken via outbound long-polling; de `proxy.budie.eu` TLS route hoeft **niet** actief te zijn. De Mini App (`/app`) vereist de route **wel** — die wordt geserveerd via de admin UI op poort 9443.
+- **SELinux-vriendelijk deploy** — bestanden in `/opt` krijgen `usr_t` context na `restorecon`; systemd kan deze uitvoeren. Bestanden in `$HOME` met `user_home_t` worden geblokkeerd.
+- **Sudoers strikt begrensd** — `pyproxy` mag uitsluitend `sudo systemctl restart py-proxy` uitvoeren; geen andere escalatiemogelijkheden.
+- **config.json niet in git** — bevat Gmail app-wachtwoord, Telegram bot-token en TOTP-geheim. Nooit committen. Op het systeem alleen leesbaar als root.
+- **TOTP-geheim backup** — sla het geheim op bij het instellen. Zonder backup én zonder werkende e-mail/Telegram-fallback ben je buitengesloten als je de authenticator-app kwijtraakt.
+
+### Netwerk en toegangscontrole
+
+- **Admin UI niet direct bereikbaar** — poort 9443 staat niet open in de firewall; de UI is alleen bereikbaar via de TLS route `proxy.budie.eu` (SNI → localhost:9443).
+- **Admin UI vereist HTTPS** — de proxy weigert te starten zonder geldig `tls_cert`/`tls_key`; plaintext HTTP is niet mogelijk.
+- **SNI-validatie** — verbindingen zonder geldig SNI-veld in de ClientHello worden direct verbroken; de proxy routeert nooit blindweg.
+- **Uitgeschakelde routes** — TCP routes laten de verbinding direct vallen; TLS routes sturen een 503-pagina terug als er een cert beschikbaar is, anders stille sluiting.
 - **FreeCourts firewall-regel** (8444→8443) — omzeilt de proxy volledig. Nu disabled; niet inschakelen tenzij bewust gewenst.
-- **TLS private keys** — proxy logt een waarschuwing bij opstarten als een key-bestand bredere permissies heeft dan `0o600`.
-- **Terminal WebSocket** (`/term_sock`) — maximaal 1 gelijktijdige sessie per sessie-token; tweede poging krijgt HTTP 409.
-- **Telegram /logs** — filtert regels met `password`, `secret`, `token` of `key` vóór verzending naar Telegram.
+
+### TLS en certificaten
+
+- **TLS private key permissiecheck** — bij elke start logt de proxy een waarschuwing als een key-bestand ruimere permissies heeft dan `0o600`.
+- **TLS handshake timeout** — 10 seconden; hangende handshakes worden afgebroken.
+- **Idle connection timeout** (TLS-terminatie modus) — verbindingen zonder activiteit worden na 30 seconden gesloten; voorkomt event-loop-vervuiling door idle keep-alive sessies.
+- **SMTP via SSL/TLS** — OTP-e-mails worden verstuurd via `SMTP_SSL` (versleuteld kanaal); het Gmail app-wachtwoord gaat nooit plaintext over het netwerk.
+
+### Authenticatie en sessies
+
+Zie ook de volledige beschrijving onder [Authenticatie](#authenticatie).
+
+- **TOTP geheimgeneratie** — `secrets.token_bytes(20)` (160 bits); cryptografisch veilig, niet voorspelbaar.
+- **Constante-tijd vergelijking** — TOTP-codes worden vergeleken met `hmac.compare_digest()` om timing-aanvallen te voorkomen.
+- **TOTP replay-bescherming** — gebruikte time-steps worden bijgehouden in `_totp_used_steps`; hergebruik van een code binnen hetzelfde venster wordt geblokkeerd.
+- **OTP willekeurigheid** — 8-cijferige codes gegenereerd met `secrets.randbelow()`; niet met `random`.
+- **OTP rate limiting** — minimaal 60 seconden tussen aanvragen, gehandhaafd per IP-adres; bij overschrijding HTTP 429.
+- **OTP brute force-bescherming** — na 10 foutieve verificatiepogingen wordt de openstaande code ongeldig gemaakt.
+- **Sessiecookie flags** — `proxy_session` heeft `HttpOnly; Secure; SameSite=Strict`; JavaScript kan de cookie niet uitlezen en cross-site requests sturen de cookie niet mee (CSRF-bescherming zonder apart token).
+- **Sliding window expiry** — elke geauthenticeerde request verlengt de sessie-TTL met 30 minuten; na 30 minuten inactiviteit vervalt de sessie automatisch.
+- **Sessie cleanup** — verlopen sessies en OTP-codes worden elke 60 seconden opgeruimd.
+
+### Telegram-beveiliging
+
+- **Outbound long-polling** — de bot werkt puur via uitgaande HTTPS-verbindingen naar de Telegram API; er is geen inkomende poort of webhook nodig.
+- **WebApp initData-validatie** — de Mini App stuurt een HMAC-SHA256 gesigneerde `initData`; de proxy verifieert de handtekening met een sleutel afgeleid van het bot-token.
+- **auth_date tijdvenster** — `initData` ouder dan 24 uur wordt geweigerd; dit beperkt de herbruikbaarheid van onderschepte tokens.
+- **allowed_chat_ids gehandhaafd op alle handlers** — zowel bot-commando's, callback queries als WebApp-requests worden geweigerd als de chat-ID niet in de allowlist staat. Een lege lijst sluit iedereen buiten.
+- **Gevoelige data gefilterd in /logs** — regels met `password`, `secret`, `token` of `key` worden verwijderd vóór verzending naar Telegram.
+
+### Input-validatie en XSS-preventie
+
+- **html.escape() op foutpagina's** — de SNI-hostnaam en het admin-adres worden ge-escaped vóór opname in HTML-responses; voorkomt reflected XSS.
+- **JSON-parsing met validatie** — alle API-endpoints parsen de body in een try/except en retourneren HTTP 400 bij malformed JSON of ontbrekende velden.
+- **TOTP secret-validatie** — het geheim wordt base32-gedecodeerd vóór opslag; ongeldige geheimen worden geweigerd.
+
+### Request- en verbindingstimeouts (admin UI)
+
+| Fase | Timeout |
+|------|---------|
+| Request-regel lezen | 30 seconden |
+| Headers lezen | 10 seconden per regel |
+| Body lezen | 10 seconden |
+| Backend connect | configureerbaar, standaard 10 s |
+| Backend read | configureerbaar, standaard 5 s |
+| TLS handshake | 10 seconden |
+| Idle (TLS-terminatie) | 30 seconden |
 
 ## Bekende valkuilen
 
@@ -323,3 +403,5 @@ Per TCP-route: idem. Daarnaast: aantal verbindingen met onbekende SNI.
 - `onchange`-attribuut in de admin UI gebruikt enkele aanhalingstekens — `JSON.stringify` geeft dubbele aanhalingstekens terug die het HTML-attribuut anders zouden breken.
 - Pad-gebaseerde routing (hostname + pad) is geprobeerd maar werkt niet betrouwbaar voor applicaties zoals pfSense die URLs dynamisch opbouwen in JavaScript. Gebruik altijd een eigen subdomein per applicatie.
 - HTTP/2 connection coalescing: als twee domeinen hetzelfde wildcard-cert en IP-adres delen, hergebruikt de browser de TLS-verbinding. Geef zulke domeinen een eigen cert om dit te voorkomen.
+- Bij containerdeployment werkt het Telegram `/restart`-commando niet (roept `systemctl` aan). Gebruik `podman compose restart py-proxy` als handmatige fallback.
+- Bij containerdeployment werkt `/logs` (leest journald) mogelijk niet als journald niet beschikbaar is in de container. Gebruik `docker compose logs` in dat geval.

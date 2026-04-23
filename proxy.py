@@ -13,14 +13,12 @@ Signals:
 
 import asyncio
 import base64
-import fcntl
 import hashlib
 import hmac
 import html
 import json
 import logging
 import os
-import pty
 import re
 import secrets
 import signal
@@ -29,7 +27,6 @@ import ssl
 import struct
 import subprocess
 import sys
-import termios
 import time
 import urllib.error
 import urllib.parse
@@ -71,7 +68,6 @@ _sessions:  dict[str, float]              = {}   # token → expires_at
 _last_code_ts: float                      = 0.0  # tijdstip laatste code-aanvraag (globaal)
 _code_ts_per_ip: dict[str, float]         = {}   # ip → tijdstip laatste code-aanvraag
 _verify_attempts: int                     = 0    # foutieve verify-pogingen sinds laatste code
-_active_ws_tokens: set[str]               = set() # sessietokens met een actieve terminal WS
 
 # Alert-cooldowns (voorkomt spam bij aanhoudende backend-problemen)
 _alert_cooldowns: dict[str, float] = {}  # backend_name → tijdstip laatste alert
@@ -894,132 +890,6 @@ def _fmt_bytes(n: int) -> str:
     return f"{n}TB"
 
 
-# ── WebSocket + PTY terminal ─────────────────────────────────────────────────
-
-_WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-
-def _ws_accept_key(key: str) -> str:
-    return base64.b64encode(hashlib.sha1((key + _WS_MAGIC).encode()).digest()).decode()
-
-
-async def _ws_read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
-    """Read one WebSocket frame from client (always masked). Returns (opcode, payload)."""
-    header = await reader.readexactly(2)
-    opcode = header[0] & 0x0F
-    masked = bool(header[1] & 0x80)
-    length = header[1] & 0x7F
-    if length == 126:
-        length = struct.unpack('>H', await reader.readexactly(2))[0]
-    elif length == 127:
-        length = struct.unpack('>Q', await reader.readexactly(8))[0]
-    if length > 1_048_576:
-        raise ValueError(f"WebSocket frame too large: {length} bytes")
-    mask = await reader.readexactly(4) if masked else b''
-    payload = await reader.readexactly(length)
-    if masked:
-        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-    return opcode, payload
-
-
-def _ws_frame(data: bytes, opcode: int = 0x2) -> bytes:
-    """Build an unmasked WebSocket frame (server→client)."""
-    n = len(data)
-    if n < 126:
-        return bytes([0x80 | opcode, n]) + data
-    if n < 65536:
-        return bytes([0x80 | opcode, 126]) + struct.pack('>H', n) + data
-    return bytes([0x80 | opcode, 127]) + struct.pack('>Q', n) + data
-
-
-def _pty_read(fd: int) -> Optional[bytes]:
-    """Blocking PTY read; returns None on EOF/error."""
-    try:
-        data = os.read(fd, 4096)
-        return data or None
-    except OSError:
-        return None
-
-
-async def handle_terminal_ws(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Manage a bash PTY session over an already-upgraded WebSocket connection."""
-    loop = asyncio.get_event_loop()
-    master_fd = slave_fd = -1
-    proc = None
-    try:
-        master_fd, slave_fd = pty.openpty()
-        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
-
-        # Na dup2 in de child is fd 0 de slave PTY. setsid() maakt de child
-        # session leader; TIOCSCTTY stelt de slave in als controlling terminal.
-        # Zonder dit heeft bash geen job control en geen controlling terminal.
-        _TIOCSCTTY = getattr(termios, 'TIOCSCTTY', 0x540E)
-        def _setup_tty():
-            os.setsid()
-            fcntl.ioctl(0, _TIOCSCTTY, 0)
-
-        proc = subprocess.Popen(
-            ['/bin/bash'],
-            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-            close_fds=True,
-            env={**os.environ, 'TERM': 'xterm-256color'},
-            preexec_fn=_setup_tty,
-        )
-        os.close(slave_fd)
-        slave_fd = -1
-
-        async def pty_to_ws() -> None:
-            while True:
-                data = await loop.run_in_executor(None, _pty_read, master_fd)
-                if data is None:
-                    break
-                writer.write(_ws_frame(data, 0x2))
-                await writer.drain()
-
-        async def ws_to_pty() -> None:
-            while True:
-                opcode, payload = await _ws_read_frame(reader)
-                if opcode == 0x8:   # close
-                    break
-                if opcode in (0x1, 0x2):
-                    try:
-                        msg = json.loads(payload)
-                        t = msg.get('type')
-                        if t == 'stdin':
-                            os.write(master_fd, msg['data'].encode('utf-8', errors='replace'))
-                        elif t == 'resize':
-                            cols = max(1, int(msg.get('cols', 80)))
-                            rows = max(1, int(msg.get('rows', 24)))
-                            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
-                                        struct.pack('HHHH', rows, cols, 0, 0))
-                    except Exception:
-                        pass
-
-        ws_task  = asyncio.create_task(ws_to_pty())
-        pty_task = asyncio.create_task(pty_to_ws())
-        await asyncio.wait([ws_task, pty_task], return_when=asyncio.FIRST_COMPLETED)
-        for t in (ws_task, pty_task):
-            t.cancel()
-        logger.info("Terminal sessie beëindigd")
-    except Exception as exc:
-        logger.debug(f"Terminal WS error: {exc}")
-    finally:
-        if proc:
-            try: proc.kill()
-            except Exception: pass
-            try: proc.wait()
-            except Exception: pass
-        for fd in (master_fd, slave_fd):
-            if fd >= 0:
-                try: os.close(fd)
-                except OSError: pass
-        try:
-            writer.write(_ws_frame(b'', 0x8))
-            await writer.drain()
-        except Exception:
-            pass
-
-
 # ── Admin HTML pages ──────────────────────────────────────────────────────────
 
 LOGO_SVG = """\
@@ -1414,19 +1284,6 @@ ADMIN_HTML = """\
                 border-radius: 6px; padding: .3rem .8rem; font-size: .82rem;
                 cursor: pointer; }
   .btn-logout:hover { background: #f3f4f6; }
-  .btn-term { background: #111; border: none; color: #e2e8f0;
-              border-radius: 6px; padding: .3rem .8rem; font-size: .82rem;
-              cursor: pointer; font-family: monospace; }
-  .btn-term:hover { background: #333; }
-  #term-overlay { display:none; position:fixed; inset:0; background:#000;
-                  z-index:1000; flex-direction:column; }
-  #term-topbar  { display:flex; align-items:center; justify-content:space-between;
-                  padding:.4rem 1rem; background:#111; flex-shrink:0; }
-  #term-topbar span { color:#888; font-size:.82rem; font-family:monospace; }
-  #term-close { background:none; border:none; color:#aaa; font-size:1.1rem;
-                cursor:pointer; padding:.2rem .5rem; line-height:1; }
-  #term-close:hover { color:#fff; }
-  #term-container { flex:1; overflow:hidden; }
   table { width: 100%; max-width: 800px; border-collapse: collapse; background: #fff;
           border-radius: 10px; overflow: hidden; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
   th { background: #f7f7f7; padding: .7rem 1.2rem; text-align: left; font-size: .8rem;
@@ -1508,19 +1365,9 @@ ADMIN_HTML = """\
     <h1>SNI Proxy</h1>
   </div>
   <div class="topbar-btns">
-    <button class="btn-term" onclick="openTerminal()">&#xbb; Terminal</button>
     <button class="btn-logout" onclick="resetStats()" title="Verbindingstellers resetten">&#x21BA; Tellers</button>
     <button class="btn-logout" onclick="logout()">Uitloggen</button>
   </div>
-</div>
-
-<!-- Terminal overlay -->
-<div id="term-overlay">
-  <div id="term-topbar">
-    <span>&#xbb; bash</span>
-    <button id="term-close" onclick="closeTerminal()">&#x2715;</button>
-  </div>
-  <div id="term-container"></div>
 </div>
 <div class="kpi-row">
   <div class="kpi"><div class="kpi-label">Actief TLS</div><div class="kpi-value" id="k-tls">—</div></div>
@@ -1845,121 +1692,6 @@ loadStats();
 setInterval(loadStats, 15000);
 setInterval(() => { load(); loadTcp(); }, 15000);
 
-// ── Terminal ──────────────────────────────────────────────────────────────────
-let _termWs = null, _termObj = null;
-
-function _loadAsset(tag, attrs) {
-  return new Promise((res, rej) => {
-    const el = document.createElement(tag);
-    Object.assign(el, attrs);
-    el.onload = res; el.onerror = rej;
-    document.head.appendChild(el);
-  });
-}
-
-async function _ensureXterm() {
-  if (window.Terminal) return;
-  await _loadAsset('link', {rel:'stylesheet',
-    href:'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css'});
-  await _loadAsset('script', {src:'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js'});
-  await _loadAsset('script', {src:'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js'});
-}
-
-async function openTerminal() {
-  const overlay = document.getElementById('term-overlay');
-  overlay.style.display = 'flex';
-  try { await _ensureXterm(); } catch(e) {
-    showMsg('Kon xterm.js niet laden — controleer internetverbinding.', false);
-    overlay.style.display = 'none'; return;
-  }
-
-  if (_termObj) { _termObj.dispose(); _termObj = null; }
-  const container = document.getElementById('term-container');
-  container.innerHTML = '';
-
-  _termObj = new Terminal({cursorBlink:true, fontSize:14,
-    theme:{background:'#000000', foreground:'#e2e8f0'}});
-  const fit = new FitAddon.FitAddon();
-  _termObj.loadAddon(fit);
-  _termObj.open(container);
-  fit.fit();
-
-  const onResize = () => fit.fit();
-  window.addEventListener('resize', onResize);
-
-  // ── Mobiel toetsenbord ────────────────────────────────────────────────────
-  // Canvas-elementen triggeren geen soft-keyboard. Een verborgen textarea
-  // krijgt focus bij een touch en stuurt de input door naar de WebSocket.
-  const kb = document.createElement('textarea');
-  kb.style.cssText = 'position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;font-size:16px;z-index:1001;';
-  kb.setAttribute('autocomplete','off'); kb.setAttribute('autocorrect','off');
-  kb.setAttribute('autocapitalize','none'); kb.setAttribute('spellcheck','false');
-  overlay.appendChild(kb);
-
-  function _sendWs(data) {
-    if (_termWs && _termWs.readyState === WebSocket.OPEN)
-      _termWs.send(JSON.stringify({type:'stdin', data}));
-  }
-
-  container.addEventListener('touchstart', () => kb.focus(), {passive:true});
-
-  kb.addEventListener('input', () => {
-    let v = kb.value; kb.value = '';
-    if (v) _sendWs(v.replace(/\\n/g, '\\r'));
-  });
-
-  kb.addEventListener('keydown', e => {
-    const map = {Backspace:'\\x7f', Tab:'\\t', Escape:'\\x1b',
-                 ArrowUp:'\\x1b[A', ArrowDown:'\\x1b[B',
-                 ArrowRight:'\\x1b[C', ArrowLeft:'\\x1b[D'};
-    if (e.ctrlKey && e.key.length === 1) {
-      e.preventDefault();
-      _sendWs(String.fromCharCode(e.key.toLowerCase().charCodeAt(0) - 96));
-      return;
-    }
-    const seq = map[e.key];
-    if (seq) { e.preventDefault(); _sendWs(seq); }
-  });
-  // ─────────────────────────────────────────────────────────────────────────
-
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  _termWs = new WebSocket(proto + '//' + location.host + '/term_sock');
-  _termWs._onResize = onResize;
-  _termWs._kb = kb;
-  _termWs.binaryType = 'arraybuffer';
-
-  _termWs.onopen = () => {
-    _termObj.onData(data => {
-      if (_termWs && _termWs.readyState === WebSocket.OPEN)
-        _termWs.send(JSON.stringify({type:'stdin', data}));
-    });
-    _termObj.onResize(({cols, rows}) => {
-      if (_termWs && _termWs.readyState === WebSocket.OPEN)
-        _termWs.send(JSON.stringify({type:'resize', cols, rows}));
-    });
-    fit.fit();
-    _termObj.focus();
-  };
-
-  _termWs.onmessage = e => {
-    if (!_termObj) return;
-    _termObj.write(e.data instanceof ArrayBuffer ? new Uint8Array(e.data) : e.data);
-  };
-
-  _termWs.onclose = () => {
-    if (_termObj) _termObj.write('\\r\\n[sessie be\u00ebindigd]\\r\\n');
-  };
-}
-
-function closeTerminal() {
-  document.getElementById('term-overlay').style.display = 'none';
-  if (_termWs) {
-    if (_termWs._onResize) window.removeEventListener('resize', _termWs._onResize);
-    if (_termWs._kb) _termWs._kb.remove();
-    _termWs.close(); _termWs = null;
-  }
-  if (_termObj) { _termObj.dispose(); _termObj = null; }
-}
 </script>
 </body>
 </html>
@@ -2322,33 +2054,6 @@ async def handle_admin(
         session_token = cookies.get("proxy_session")
         authed = _check_session(session_token)
 
-
-        # ── WebSocket upgrade voor terminal ───────────────────────────────────
-        if (headers_raw.get('upgrade', '').lower() == 'websocket'
-                and path == '/term_sock'):
-            if not authed:
-                writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                await writer.drain()
-                return
-            if session_token in _active_ws_tokens:
-                writer.write(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                await writer.drain()
-                return
-            ws_key = headers_raw.get('sec-websocket-key', '')
-            writer.write((
-                "HTTP/1.1 101 Switching Protocols\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                f"Sec-WebSocket-Accept: {_ws_accept_key(ws_key)}\r\n\r\n"
-            ).encode())
-            await writer.drain()
-            logger.info("Terminal WebSocket geopend")
-            _active_ws_tokens.add(session_token)
-            try:
-                await handle_terminal_ws(reader, writer)
-            finally:
-                _active_ws_tokens.discard(session_token)
-            return
 
         STATUS_TEXTS = {
             200: "OK", 302: "Found", 400: "Bad Request",
