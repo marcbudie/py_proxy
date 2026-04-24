@@ -190,6 +190,19 @@ Voeg `"auto_disable_minutes": N` toe aan een route om hem automatisch uit te sch
 
 Werkt voor zowel TLS- als TCP-routes. De timer start op het moment van inschakelen (via toggle in de UI, Telegram of direct in config). De background task controleert elke 15 seconden; bij auto-uitschakelen wordt een Telegram-melding verstuurd (⏱ Auto-uitgeschakeld). De admin UI toont een oranje afteltimer per route en ververst de tabellen elke 15 seconden automatisch.
 
+### Naam-gebaseerde groepering
+
+Routes met dezelfde `name` worden als groep behandeld: als één route wordt aan- of uitgeschakeld, volgen alle andere routes (TLS én TCP) met dezelfde naam automatisch. Dit werkt via de admin UI, Telegram-toggles en de auto-disable timer.
+
+```json
+"thinlinc.budie.eu": {"host": "192.168.2.76", "port": 300, "name": "thinlinc-web", ...},
+"tcp_routes": {
+  "3333": {"host": "192.168.2.76", "port": 300, "name": "thinlinc-web", ...}
+}
+```
+
+Elke route berekent zijn eigen `enabled_until` op basis van zijn eigen `auto_disable_minutes` — de timer-instellingen per route blijven onafhankelijk.
+
 ### TCP routes
 
 `tcp_routes` zijn voor plain TCP-verkeer zonder TLS (bijv. SSH, RDP). De sleutel is het poortnummer waarop de proxy luistert (als string); het verkeer wordt ongewijzigd doorgestuurd naar de backend. Er is geen SNI-inspectie — elke verbinding op die poort gaat naar de geconfigureerde backend.
@@ -218,7 +231,7 @@ Bereikbaar op `https://<host>:9443/`. Vereist inloggen via OTP-code (zie Authent
 
 Functionaliteit:
 
-- **Aan/uit toggle** per TLS route en per TCP route — direct actief, opgeslagen in `config.json`
+- **Aan/uit toggle** per TLS route en per TCP route — direct actief, opgeslagen in `config.json`; routes met dezelfde `name` volgen automatisch mee (zie [Naam-gebaseerde groepering](#naam-gebaseerde-groepering))
 - **Verwijderen** per TLS route — met bevestigingsdialoog
 - **Toevoegen** TLS route via formulier onderaan — velden: hostname, backend host, poort, label, checkbox "HTTP backend (TLS termineren)"
 - Aparte TCP routes sectie met toggle per route
