@@ -1484,6 +1484,7 @@ async function toggle(hostname, el) {
     const data = await r.json();
     showMsg(`${hostname} is nu ${data.enabled ? 'ingeschakeld' : 'uitgeschakeld'}.`, true);
     await load();
+    await loadTcp();
   } catch (e) {
     el.checked = !el.checked;
     showMsg('Netwerkfout: ' + e, false);
@@ -1576,6 +1577,7 @@ async function toggleTcp(port, el) {
     if (!r.ok) { el.checked = !el.checked; showMsg('Fout bij omschakelen van poort ' + port, false); return; }
     const data = await r.json();
     showMsg(`TCP :${port} is nu ${data.enabled ? 'ingeschakeld' : 'uitgeschakeld'}.`, true);
+    await load();
     await loadTcp();
   } catch (e) {
     el.checked = !el.checked;
@@ -1908,6 +1910,7 @@ async function tog(cb){
     }
     if(tg.HapticFeedback)tg.HapticFeedback.impactOccurred('light');
     toast(d.enabled?'\\u2705 Ingeschakeld':'\\u274C Uitgeschakeld');
+    await load();
   }catch{cb.checked=!cb.checked;toast('Toggle mislukt');}
   cb.disabled=false;
 }
@@ -2000,13 +2003,30 @@ async def handle_tcp_connection(
             pass
 
 
-def _apply_toggle(backend: Backend) -> None:
-    """Toggle backend.enabled en zet/wis enabled_until conform auto_disable_minutes."""
+def _sync_group(cfg: "Config", source: Backend) -> None:
+    """Zet alle routes (TLS + TCP) met dezelfde naam als source naar dezelfde enabled-toestand.
+    Elke sibling berekent zijn eigen enabled_until op basis van zijn eigen auto_disable_minutes."""
+    now = time.time()
+    for b in list(cfg.tls_routes.values()) + list(cfg.tcp_routes.values()):
+        if b is source or b.name != source.name:
+            continue
+        b.enabled = source.enabled
+        if b.enabled and b.auto_disable_minutes > 0:
+            b.enabled_until = now + b.auto_disable_minutes * 60
+        else:
+            b.enabled_until = None
+
+
+def _apply_toggle(backend: Backend, cfg: Optional["Config"] = None) -> None:
+    """Toggle backend.enabled en zet/wis enabled_until conform auto_disable_minutes.
+    Als cfg meegegeven: synct alle routes met dezelfde naam naar dezelfde toestand."""
     backend.enabled = not backend.enabled
     if backend.enabled and backend.auto_disable_minutes > 0:
         backend.enabled_until = time.time() + backend.auto_disable_minutes * 60
     else:
         backend.enabled_until = None
+    if cfg is not None:
+        _sync_group(cfg, backend)
 
 
 async def handle_admin(
@@ -2437,7 +2457,7 @@ async def handle_admin(
                 if backend is None:
                     json_resp(404, {"error": "Route niet gevonden."})
                 else:
-                    _apply_toggle(backend)
+                    _apply_toggle(backend, proxy_server.cfg)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"Route {hostname} {state} via admin UI")
@@ -2466,7 +2486,7 @@ async def handle_admin(
                 if backend is None:
                     json_resp(404, {"error": "TCP route niet gevonden."})
                 else:
-                    _apply_toggle(backend)
+                    _apply_toggle(backend, proxy_server.cfg)
                     save_config(proxy_server.cfg, proxy_server.config_path)
                     state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
                     logger.info(f"TCP route :{listen_port} {state} via admin UI")
@@ -2774,7 +2794,7 @@ async def _tg_handle_message(
         else:
             new_enabled = command == "/proxyaan"
             if backend.enabled != new_enabled:
-                _apply_toggle(backend)
+                _apply_toggle(backend, proxy.cfg)
             save_config(proxy.cfg, proxy.config_path)
             state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
             icon  = "✅" if backend.enabled else "❌"
@@ -2809,7 +2829,7 @@ async def _tg_handle_callback(
             await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
                                     {"callback_query_id": cb_id, "text": "Route niet gevonden"})
             return
-        _apply_toggle(backend)
+        _apply_toggle(backend, proxy.cfg)
         save_config(proxy.cfg, proxy.config_path)
         state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
         logger.info(f"Telegram: TLS route {hostname} {state}")
@@ -2825,7 +2845,7 @@ async def _tg_handle_callback(
             await asyncio.to_thread(_tg_call, token, "answerCallbackQuery",
                                     {"callback_query_id": cb_id, "text": "TCP route niet gevonden"})
             return
-        _apply_toggle(backend)
+        _apply_toggle(backend, proxy.cfg)
         save_config(proxy.cfg, proxy.config_path)
         state = "ingeschakeld" if backend.enabled else "uitgeschakeld"
         logger.info(f"Telegram: TCP route :{port} {state}")
@@ -2997,12 +3017,14 @@ class ProxyServer:
                     if backend.enabled and backend.enabled_until is not None and now >= backend.enabled_until:
                         backend.enabled = False
                         backend.enabled_until = None
+                        _sync_group(self.cfg, backend)
                         disabled.append(f"TLS:{hostname}")
                         logger.info(f"Route {hostname} automatisch uitgeschakeld (auto_disable_minutes={backend.auto_disable_minutes})")
                 for port, backend in self.cfg.tcp_routes.items():
                     if backend.enabled and backend.enabled_until is not None and now >= backend.enabled_until:
                         backend.enabled = False
                         backend.enabled_until = None
+                        _sync_group(self.cfg, backend)
                         disabled.append(f"TCP:{port}")
                         logger.info(f"TCP route :{port} automatisch uitgeschakeld (auto_disable_minutes={backend.auto_disable_minutes})")
                 if disabled:
