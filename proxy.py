@@ -448,6 +448,15 @@ def _rewrite_host_header(data: bytes, new_host: str) -> bytes:
     )
 
 
+def _inject_xforwarded(data: bytes, client_ip: str) -> bytes:
+    """Voeg X-Forwarded-For in na de eerste request-regel (eenmalig)."""
+    return re.sub(
+        rb'\r\n',
+        b'\r\nX-Forwarded-For: ' + client_ip.encode('ascii'),
+        data, count=1,
+    )
+
+
 async def _tls_terminate_and_pipe(
     initial: bytes,
     client_reader: asyncio.StreamReader,
@@ -456,9 +465,11 @@ async def _tls_terminate_and_pipe(
     be_reader: asyncio.StreamReader,
     be_writer: asyncio.StreamWriter,
     backend_host: str = "",
+    client_ip: str = "",
 ) -> tuple[int, int]:
     """Termineer TLS aan de client-kant en pip plain bytes naar/van de backend.
-    Als backend_host opgegeven is, wordt de Host-header herschreven."""
+    Als backend_host opgegeven is, wordt de Host-header herschreven.
+    Als client_ip opgegeven is, wordt X-Forwarded-For geïnjecteerd."""
     incoming = ssl.MemoryBIO()
     outgoing = ssl.MemoryBIO()
     ssl_obj = ssl_ctx.wrap_bio(incoming, outgoing, server_side=True)
@@ -490,13 +501,16 @@ async def _tls_terminate_and_pipe(
     # Bidirectioneel pipen via event-loop tasks
     c_to_b = 0
     b_to_c = 0
-    _host_rewritten = False
+    _headers_rewritten = False
 
     def _maybe_rewrite(data: bytes) -> bytes:
-        nonlocal _host_rewritten
-        if backend_host and not _host_rewritten:
-            _host_rewritten = True
-            return _rewrite_host_header(data, backend_host)
+        nonlocal _headers_rewritten
+        if not _headers_rewritten:
+            _headers_rewritten = True
+            if backend_host:
+                data = _rewrite_host_header(data, backend_host)
+            if client_ip:
+                data = _inject_xforwarded(data, client_ip)
         return data
 
     # Na de handshake kan er al application data in de MemoryBIO zitten
@@ -855,6 +869,7 @@ async def handle_connection(
             up, down = await _tls_terminate_and_pipe(
                 initial, client_reader, client_writer, ssl_ctx, be_reader, be_writer,
                 backend_host=be_host_hdr,
+                client_ip=peer[0],
             )
         else:
             be_writer.write(initial)
