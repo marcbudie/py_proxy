@@ -440,20 +440,21 @@ async def send_tls_error_page(
 
 
 def _rewrite_host_header(data: bytes, new_host: str) -> bytes:
-    """Vervang de Host-header in het eerste HTTP-verzoek (eenmalig)."""
+    """Vervang de Host-header in elke HTTP-request (ook keep-alive)."""
     return re.sub(
         rb'(?i)Host:[ \t]*[^\r\n]+\r\n',
         b'Host: ' + new_host.encode('ascii') + b'\r\n',
-        data, count=1,
+        data,
     )
 
 
 def _inject_xforwarded(data: bytes, client_ip: str) -> bytes:
-    """Voeg X-Forwarded-For in na de eerste request-regel (eenmalig)."""
+    """Voeg X-Forwarded-For in na elke request-regel (ook keep-alive)."""
+    xff = b'X-Forwarded-For: ' + client_ip.encode('ascii') + b'\r\n'
     return re.sub(
-        rb'\r\n',
-        b'\r\nX-Forwarded-For: ' + client_ip.encode('ascii'),
-        data, count=1,
+        rb'((?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE) [^\r\n]+ HTTP/1\.[01]\r\n)',
+        lambda m: m.group(0) + xff,
+        data,
     )
 
 
@@ -501,16 +502,11 @@ async def _tls_terminate_and_pipe(
     # Bidirectioneel pipen via event-loop tasks
     c_to_b = 0
     b_to_c = 0
-    _headers_rewritten = False
-
     def _maybe_rewrite(data: bytes) -> bytes:
-        nonlocal _headers_rewritten
-        if not _headers_rewritten:
-            _headers_rewritten = True
-            if backend_host:
-                data = _rewrite_host_header(data, backend_host)
-            if client_ip:
-                data = _inject_xforwarded(data, client_ip)
+        if backend_host:
+            data = _rewrite_host_header(data, backend_host)
+        if client_ip:
+            data = _inject_xforwarded(data, client_ip)
         return data
 
     # Na de handshake kan er al application data in de MemoryBIO zitten

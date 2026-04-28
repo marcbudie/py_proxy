@@ -173,6 +173,8 @@ De proxy termineert dan TLS aan de client-kant (met het wildcard-cert of een per
 
 **Host-header rewrite:** de proxy herschrijft automatisch de `Host`-header naar het backend-adres (bijv. `192.168.2.254` of `192.168.2.254:8080`). Dit is nodig omdat veel apparaten (routers, NAS, etc.) requests weigeren met een externe hostnaam in de Host-header.
 
+**X-Forwarded-For:** de proxy voegt automatisch `X-Forwarded-For: <client-ip>` toe aan elk HTTP-request. Dit werkt ook bij HTTP/1.1 keep-alive verbindingen waarbij meerdere requests over dezelfde TLS-sessie lopen. De backend moet de header vertrouwen; bij uvicorn gaat dat via `--proxy-headers --forwarded-allow-ips 127.0.0.1`.
+
 **Keep-alive / idle timeout:** verbindingen zonder activiteit worden na 30 seconden gesloten. Dit voorkomt dat trage of idle HTTP/1.1 keep-alive verbindingen de event loop belasten. Pagina's die veel resources laden (zoals Flutter web apps) openen tientallen gelijktijdige verbindingen — dit wordt correct afgehandeld.
 
 In de admin UI staat bij "Route toevoegen" een checkbox "HTTP backend (TLS termineren)". Bestaande routes aanpassen: handmatig `"tls_terminate": true/false` in `config.json` zetten en daarna `systemctl reload py-proxy`.
