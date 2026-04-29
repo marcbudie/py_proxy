@@ -41,6 +41,7 @@ LOG="$SOURCE/backup.log"
             --exclude "*.p7b" \
             --exclude "*.jks" \
             --exclude "*.zip" \
+            --check-first \
             --config "$RCLONE_CONFIG" \
             --fast-list \
             --progress
